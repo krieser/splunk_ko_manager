@@ -2,17 +2,122 @@ import argparse
 import json
 import os
 import sys
-from typing import Dict, Any, Tuple, Optional
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-import urllib3
+from typing import Dict, Tuple, Optional
 
 DEFAULT_TIMEOUT = 30  # seconds
+_MISSING = object()
 
-def create_http_session(retries: int = 3, backoff_factor: float = 0.5) -> requests.Session:
+def parse_requested_keys(keys_arg: str) -> list:
+    """Parse comma-separated key list, ignoring empty segments."""
+    if not keys_arg:
+        return []
+    return [k.strip() for k in keys_arg.split(",") if k.strip()]
+
+def normalize_content(content) -> dict:
+    """Normalize Splunk REST content to a flat string-keyed dict."""
+    if isinstance(content, dict):
+        return content
+    if isinstance(content, list):
+        normalized = {}
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            key = item.get("name") or item.get("key")
+            if key is not None and "value" in item:
+                normalized[str(key)] = item["value"]
+        return normalized
+    return {}
+
+def splunk_key_candidates(requested_key: str) -> list:
+    """Return Splunk REST lookup paths for common ACL and config aliases."""
+    candidates = [requested_key]
+    if requested_key == "sharing":
+        candidates.extend(["eai:acl.sharing", "acl.sharing"])
+    elif requested_key == "owner":
+        candidates.extend(["eai:acl.owner", "acl.owner"])
+    elif requested_key.startswith("eai:acl."):
+        candidates.append(f"acl.{requested_key.split('.', 1)[1]}")
+    elif requested_key.startswith("acl."):
+        candidates.append(f"eai:acl.{requested_key.split('.', 1)[1]}")
+    return candidates
+
+def get_field_value(source: dict, key: str):
+    """Look up a field by flat key or dotted nested path."""
+    if not isinstance(source, dict) or not key:
+        return _MISSING
+    if key in source:
+        return source[key]
+    if "." not in key:
+        return _MISSING
+
+    current = source
+    for part in key.split("."):
+        if not isinstance(current, dict) or part not in current:
+            return _MISSING
+        current = current[part]
+    return current
+
+def export_requested_keys(entry: dict, requested_keys: list) -> Tuple[dict, list]:
+    """Export requested keys from a Splunk REST entry object."""
+    content = normalize_content(entry.get("content", {}))
+    entry_fields = {k: v for k, v in entry.items() if k != "content"}
+    lookup_sources = (content, entry_fields, entry)
+
+    out_p = {}
+    missing_keys = []
+    for key in requested_keys:
+        value = _MISSING
+        for candidate in splunk_key_candidates(key):
+            for source in lookup_sources:
+                candidate_value = get_field_value(source, candidate)
+                if candidate_value is not _MISSING:
+                    value = candidate_value
+                    break
+            if value is not _MISSING:
+                break
+        if value is _MISSING:
+            missing_keys.append(key)
+            out_p[key] = None
+        else:
+            out_p[key] = value
+
+    return out_p, missing_keys
+
+def suggest_similar_keys(missing_keys: list, available_keys: list) -> dict:
+    """Suggest close key names for missing exports."""
+    suggestions = {}
+    for missing in missing_keys:
+        prefix = missing.split(".")[0]
+        matches = sorted(
+            k for k in available_keys
+            if k == missing or k.startswith(f"{prefix}.") or prefix in k
+        )
+        if matches:
+            suggestions[missing] = matches[:5]
+    return suggestions
+
+def _load_http_deps():
+    """Import requests/urllib3 only when live HTTP is needed."""
+    try:
+        import requests
+        from requests.adapters import HTTPAdapter
+        from urllib3.util.retry import Retry
+        import urllib3
+        return requests, HTTPAdapter, Retry, urllib3
+    except ImportError:
+        print(
+            "Error: 'requests' is required for live HTTP operations.\n"
+            "Install dependencies with:\n"
+            "  python3 -m venv .venv && source .venv/bin/activate\n"
+            "  pip install -r requirements.txt\n"
+            "Then run this script with the venv Python (or an activated venv).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+def create_http_session(retries: int = 3, backoff_factor: float = 0.5):
     """Creates a requests Session configured with retry logic for transient failures."""
-    session = requests.Session()
+    requests, HTTPAdapter, Retry, _urllib3 = _load_http_deps()
     retry_strategy = Retry(
         total=retries,
         backoff_factor=backoff_factor,
@@ -20,6 +125,7 @@ def create_http_session(retries: int = 3, backoff_factor: float = 0.5) -> reques
         allowed_methods=["GET", "POST"]
     )
     adapter = HTTPAdapter(max_retries=retry_strategy)
+    session = requests.Session()
     session.mount("http://", adapter)
     session.mount("https://", adapter)
     return session
@@ -124,6 +230,9 @@ def main():
             payload["name"] = args.name
 
     if args.dry_run:
+        if args.mode == "export" and not args.keys:
+            print("Error: --keys is required when using '--mode export'", file=sys.stderr)
+            sys.exit(1)
         method = "GET" if args.mode == "export" else "POST"
         print(f"\n--- DRY RUN: Equivalent Curl Command for {args.mode.upper()} ---")
         print(generate_curl_dry_run(method, args.endpoint, auth, headers, payload, insecure=args.insecure))
@@ -132,6 +241,8 @@ def main():
             print(f"\nNOTE: Live run writes keys [{args.keys}] to: {dest}\n")
         return
 
+    requests, _HTTPAdapter, _Retry, urllib3 = _load_http_deps()
+
     if args.insecure:
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -139,7 +250,8 @@ def main():
 
     try:
         if args.mode == "export":
-            if not args.keys:
+            requested_keys = parse_requested_keys(args.keys)
+            if not requested_keys:
                 print("Error: --keys is required when using '--mode export'", file=sys.stderr)
                 sys.exit(1)
                 
@@ -160,20 +272,18 @@ def main():
                 sys.exit(1)
             
             target_entry = entries[0] if isinstance(entries, list) else entries
-            content = target_entry.get("content", {})
-            
-            requested_keys = [k.strip() for k in args.keys.split(",")]
-            out_p = {}
-            missing_keys = []
-            
-            for k in requested_keys:
-                if k in content:
-                    out_p[k] = content[k]
-                else:
-                    missing_keys.append(k)
-                    
+            out_p, missing_keys = export_requested_keys(target_entry, requested_keys)
+
             if missing_keys:
-                print(f"Warning: The following keys were not found in the endpoint content: {missing_keys}", file=sys.stderr)
+                content = normalize_content(target_entry.get("content", {}))
+                available_keys = sorted(set(content.keys()) | set(target_entry.keys()) - {"content"})
+                suggestions = suggest_similar_keys(missing_keys, available_keys)
+                print(
+                    f"Warning: The following keys were not found in the endpoint response: {missing_keys}",
+                    file=sys.stderr,
+                )
+                for missing, matches in suggestions.items():
+                    print(f"  Hint for '{missing}': did you mean one of {matches}?", file=sys.stderr)
 
             if args.output:
                 with open(args.output, "w") as f:

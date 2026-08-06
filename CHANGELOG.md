@@ -5,6 +5,25 @@ All notable changes to `splunk_ko_manager.py` are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-08-06
+
+### Added
+
+- **`export-savedsearches` mode** — export keys defined in `local/savedsearches.conf` for a single saved search; no `--keys` required.
+- **REST local key discovery** — identifies local keys via baseline diff and `appcontext=true` fallback (no `btool` or `SPLUNK_HOME`).
+- **`--debug-local-keys`** — optional stderr diagnostics for local key discovery.
+
+### Changed
+
+- Replaced **`export`** mode and **`--keys`** / **`--include-inherited-keys`** with the dedicated `export-savedsearches` workflow.
+- Consolidated HTTP helpers and removed unused code paths (`localonly=true`, duplicate fetch utilities).
+- Status and debug messages go to stderr; JSON export stays on stdout or `--output`.
+
+### Fixed
+
+- False positives when Splunk `defaultcontext` responses contain merged effective config instead of true `default/` layer content.
+- Extra inherited keys (for example `disabled=false`) filtered from appcontext discovery to match `btool` local validation.
+
 ## [1.0.0] - 2026-08-06
 
 First official release of the Splunk Knowledge Object Manager CLI.
@@ -28,4 +47,5 @@ First official release of the Splunk Knowledge Object Manager CLI.
 - Export output uses legible JSON (`indent=2`, sorted keys, UTF-8).
 - `endpointreview` filters out `null` values recursively before printing.
 
+[1.2.0]: #
 [1.0.0]: #

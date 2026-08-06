@@ -1,13 +1,4 @@
 __pycache__/
+*.pyc
 .venv/
 venv/
-*.pyc
-*.output
-*.tgz
-SplunkEnterpriseSecuritySuite/
-recon/
-dump.txt
-validkeys
-test
-test1
-testing

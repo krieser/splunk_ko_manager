@@ -15,7 +15,7 @@ import urllib3
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 
 _MISSING = object()
 _SAVEDSEARCH_ENDPOINT_RE = re.compile(
@@ -27,6 +27,11 @@ _CONF_ENDPOINT_RE = re.compile(
 _CONF_METADATA_KEY_PREFIXES = ("eai:",)
 # Keys Splunk usually omits from local/ unless explicitly overridden to a non-default value.
 _INHERITED_UNLESS_NONDEFAULT = frozenset({"disabled", "enableSched", "counttype"})
+
+def parse_requested_keys(keys_arg: Optional[str]) -> List[str]:
+    if not keys_arg:
+        return []
+    return [k.strip() for k in keys_arg.split(",") if k.strip()]
 
 def parse_savedsearch_endpoint(endpoint: str) -> Optional[Tuple[str, str, str]]:
     """Parse owner, app, and saved search name from a Splunk REST endpoint."""
@@ -619,6 +624,34 @@ def print_summary(mode: str, payload: dict):
         print(f" -> {k}: {val[:57] + '...' if len(val) > 60 else val}")
     print("========================================\n")
 
+def parse_requested_keys(keys_arg: Optional[str]) -> List[str]:
+    if not keys_arg:
+        return []
+    return [k.strip() for k in keys_arg.split(",") if k.strip()]
+
+def run_export(args, auth, headers) -> None:
+    """Export an explicit comma-separated key list from any REST endpoint."""
+    requested_keys = parse_requested_keys(args.keys)
+    if not requested_keys:
+        print("Error: --keys is required when using '--mode export'", file=sys.stderr)
+        sys.exit(1)
+
+    target_entry = fetch_target_entry(args.endpoint, auth, headers)
+    out_p, missing_keys = export_requested_keys(target_entry, requested_keys)
+
+    if missing_keys:
+        content = normalize_content(target_entry.get("content", {}))
+        available_keys = sorted(set(content.keys()) | set(target_entry.keys()) - {"content"})
+        suggestions = suggest_similar_keys(missing_keys, available_keys)
+        print(
+            f"Warning: The following keys were not found in the endpoint response: {missing_keys}",
+            file=sys.stderr,
+        )
+        for missing, matches in suggestions.items():
+            print(f"  Hint for '{missing}': did you mean one of {matches}?", file=sys.stderr)
+
+    write_json_output(out_p, args.output, "Successfully exported keys to '{}'")
+
 def run_export_savedsearches(args, auth, headers) -> None:
     """Export locally-defined savedsearches.conf keys for one saved search."""
     endpoint_parts = parse_savedsearch_endpoint(args.endpoint)
@@ -679,16 +712,20 @@ def run_export_savedsearches(args, auth, headers) -> None:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Splunk Knowledge Object Manager — export local saved searches, review endpoints, update/post via REST.",
+        description="Splunk Knowledge Object Manager — export, review, update, and post via REST.",
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument(
         "--mode",
         required=True,
-        choices=["export-savedsearches", "endpointreview", "update", "post"],
+        choices=["export", "export-savedsearches", "endpointreview", "update", "post"],
     )
     parser.add_argument("--endpoint", required=True, help="The Splunk REST endpoint URL.")
     parser.add_argument("--credentials", required=True, nargs=2, metavar=('{user,token}', 'VALUE'))
+    parser.add_argument(
+        "--keys",
+        help="Required for export mode. Comma-separated keys to fetch from the endpoint.",
+    )
     parser.add_argument(
         "--debug-local-keys",
         action="store_true",
@@ -698,7 +735,7 @@ def main():
     parser.add_argument("--input", help="Required for update/post modes. Source payload file path.")
     parser.add_argument(
         "--output",
-        help="Optional for export-savedsearches and endpointreview. Destination file path (defaults to STDOUT).",
+        help="Optional for export, export-savedsearches, and endpointreview. Destination file path (defaults to STDOUT).",
     )
     parser.add_argument("--name", help="Required for post mode. New resource name identifier.")
     parser.add_argument("--dry-run", action="store_true", help="Print equivalent curl statement.")
@@ -724,10 +761,13 @@ def main():
             payload["name"] = args.name
 
     if args.dry_run:
-        method = "GET" if args.mode in ("export-savedsearches", "endpointreview") else "POST"
+        method = "GET" if args.mode in ("export", "export-savedsearches", "endpointreview") else "POST"
         print(f"\n--- DRY RUN: Equivalent Curl Command for {args.mode.upper()} ---")
         print(generate_curl_dry_run(method, args.endpoint, auth, headers, payload))
-        if args.mode == "export-savedsearches":
+        if args.mode == "export":
+            dest = args.output if args.output else "STDOUT"
+            print(f"\nNOTE: Live run writes keys [{args.keys}] to: {dest}\n")
+        elif args.mode == "export-savedsearches":
             dest = args.output if args.output else "STDOUT"
             print(
                 "\nNOTE: Live run discovers local savedsearches.conf keys via REST "
@@ -739,7 +779,10 @@ def main():
         return
 
     try:
-        if args.mode == "export-savedsearches":
+        if args.mode == "export":
+            run_export(args, auth, headers)
+
+        elif args.mode == "export-savedsearches":
             run_export_savedsearches(args, auth, headers)
 
         elif args.mode == "endpointreview":

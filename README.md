@@ -20,6 +20,13 @@ pip install -r requirements.txt
 ```bash
 python splunk_ko_manager.py --version
 
+# Export specific keys (any endpoint)
+python splunk_ko_manager.py \
+  --mode export \
+  --endpoint 'https://127.0.0.1:8089/servicesNS/nobody/recon/saved/searches/my_search' \
+  --credentials user 'admin:password' \
+  --keys 'search,cron_schedule,description'
+
 # Export only keys defined in local/savedsearches.conf (no --keys required)
 python splunk_ko_manager.py \
   --mode export-savedsearches \
@@ -44,7 +51,8 @@ python splunk_ko_manager.py \
 
 | Mode | Description |
 |------|-------------|
-| `export-savedsearches` | Export keys defined in `local/savedsearches.conf` for one saved search (REST discovery; stdout or `--output`) |
+| `export` | Export an explicit comma-separated key list via `--keys` from any REST endpoint |
+| `export-savedsearches` | Export keys defined in `local/savedsearches.conf` for one saved search (REST discovery; no `--keys`) |
 | `endpointreview` | List all non-null fields returned by the endpoint |
 | `update` | POST a JSON payload from `--input` |
 | `post` | Create/update with `--input` and `--name` |

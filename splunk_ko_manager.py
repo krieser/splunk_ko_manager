@@ -16,9 +16,12 @@ import urllib3
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-__version__ = "1.4.3"
+__version__ = "1.5.0"
 MIGRATION_ENVELOPE_VERSION = "1"
 
+_DATA_UI_VIEWS_RE = re.compile(
+    r"/servicesNS/([^/]+)/([^/]+)/data/ui/views/([^/?#]+)/?$"
+)
 _MISSING = object()
 _DEFAULT_METADATA_PREFIXES = ("eai:",)
 # Reject candidate local-key sets that look like merged effective config, not local/.
@@ -117,6 +120,7 @@ CONF_TYPE_REGISTRY: Dict[str, ConfTypeSpec] = {
         "conf-macros",
         "macros",
         ko_collection="saved/macros",
+        inherited_noise_keys=frozenset({"disabled"}),
     ),
     "views": _spec(
         "views",
@@ -124,6 +128,7 @@ CONF_TYPE_REGISTRY: Dict[str, ConfTypeSpec] = {
         "conf-views",
         "views",
         ko_collection="saved/views",
+        inherited_noise_keys=frozenset({"disabled"}),
     ),
 }
 
@@ -131,6 +136,8 @@ EXPORT_MODE_TO_CONF_TYPE: Dict[str, str] = {
     "export-savedsearches": "savedsearches",
     "export-props": "props",
     "export-transforms": "transforms",
+    "export-macros": "macros",
+    "export-views": "views",
 }
 
 
@@ -157,6 +164,15 @@ def parse_requested_keys(keys_arg: Optional[str]) -> List[str]:
     if not keys_arg:
         return []
     return [k.strip() for k in keys_arg.split(",") if k.strip()]
+
+
+def parse_data_ui_views_endpoint(endpoint: str) -> Optional[Tuple[str, str, str]]:
+    """Parse owner, app, and view name from a data/ui/views REST endpoint."""
+    match = _DATA_UI_VIEWS_RE.search(urlparse(endpoint).path)
+    if not match:
+        return None
+    owner, app, view_name = match.groups()
+    return unquote(owner), unquote(app), unquote(view_name)
 
 
 def parse_ko_endpoint(endpoint: str, spec: ConfTypeSpec) -> Optional[Tuple[str, str, str]]:
@@ -205,13 +221,22 @@ def build_conf_stanza_url(
     return path
 
 
-def build_conf_endpoint_from_ko(endpoint: str, spec: ConfTypeSpec) -> Optional[str]:
-    """Build configs/conf-* endpoint from a KO collection URL."""
+def build_conf_endpoint_from_ko(
+    endpoint: str,
+    spec: ConfTypeSpec,
+    owner: Optional[str] = None,
+    app: Optional[str] = None,
+    stanza_name: Optional[str] = None,
+) -> Optional[str]:
+    """Build configs/conf-* endpoint from a KO or data/ui/views URL."""
     parsed = urlparse(endpoint)
-    parts = parse_ko_endpoint(endpoint, spec)
-    if not parts:
-        return None
-    owner, app, stanza_name = parts
+    if owner is None or app is None or stanza_name is None:
+        parts = parse_ko_endpoint(endpoint, spec)
+        if not parts and spec.name == "views":
+            parts = parse_data_ui_views_endpoint(endpoint)
+        if not parts:
+            return None
+        owner, app, stanza_name = parts
     return build_conf_stanza_url(
         f"{parsed.scheme}://{parsed.netloc}",
         owner,
@@ -248,25 +273,29 @@ def resolve_local_export_context(
     """
     Resolve owner, app, stanza, and conf REST endpoint for local export.
 
-    Accepts either a KO endpoint (when spec.ko_collection is set) or a direct
-    configs/conf-* stanza URL.
+    Accepts KO endpoints (saved/*), direct configs/conf-* URLs, or for views
+    also data/ui/views/{name}.
     """
+    conf_parts = parse_conf_endpoint(endpoint, spec)
+    if conf_parts:
+        owner, app, stanza_name = conf_parts
+        return owner, app, stanza_name, endpoint
+
     if spec.ko_collection:
         parts = parse_ko_endpoint(endpoint, spec)
+        if not parts and spec.name == "views":
+            parts = parse_data_ui_views_endpoint(endpoint)
         if not parts:
             return None
         owner, app, stanza_name = parts
-        conf_endpoint = build_conf_endpoint_from_ko(endpoint, spec)
-    else:
-        parts = parse_conf_endpoint(endpoint, spec)
-        if not parts:
+        conf_endpoint = build_conf_endpoint_from_ko(
+            endpoint, spec, owner, app, stanza_name
+        )
+        if not conf_endpoint:
             return None
-        owner, app, stanza_name = parts
-        conf_endpoint = endpoint
+        return owner, app, stanza_name, conf_endpoint
 
-    if not conf_endpoint:
-        return None
-    return owner, app, stanza_name, conf_endpoint
+    return None
 
 
 def is_conf_metadata_key(key: str, spec: ConfTypeSpec) -> bool:
@@ -1071,8 +1100,17 @@ def endpoint_hint_for_mode(mode: str) -> str:
     if not conf_type_name:
         return "/servicesNS/{owner}/{app}/..."
     spec = CONF_TYPE_REGISTRY[conf_type_name]
+    if spec.name == "views":
+        return (
+            f"/servicesNS/{{owner}}/{{app}}/{spec.ko_collection}/{{name}} or "
+            f"/servicesNS/{{owner}}/{{app}}/data/ui/views/{{name}} or "
+            f"/servicesNS/{{owner}}/{{app}}/configs/{spec.conf_rest}/{{stanza}}"
+        )
     if spec.ko_collection:
-        return f"/servicesNS/{{owner}}/{{app}}/{spec.ko_collection}/{{name}}"
+        return (
+            f"/servicesNS/{{owner}}/{{app}}/{spec.ko_collection}/{{name}} or "
+            f"/servicesNS/{{owner}}/{{app}}/configs/{spec.conf_rest}/{{stanza}}"
+        )
     return f"/servicesNS/{{owner}}/{{app}}/configs/{spec.conf_rest}/{{stanza}}"
 
 

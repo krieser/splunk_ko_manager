@@ -39,6 +39,18 @@ python splunk_ko_manager.py \
   --endpoint 'https://127.0.0.1:8089/servicesNS/nobody/myapp/configs/conf-transforms/my_transform' \
   --credentials user 'admin:password'
 
+# Macro — SPL provides KO or conf endpoint
+python splunk_ko_manager.py \
+  --mode export-macros \
+  --endpoint 'https://127.0.0.1:8089/servicesNS/nobody/myapp/saved/macros/my_macro' \
+  --credentials user 'admin:password'
+
+# View — SPL provides saved/views, data/ui/views, or conf-views endpoint
+python splunk_ko_manager.py \
+  --mode export-views \
+  --endpoint 'https://127.0.0.1:8089/servicesNS/nobody/myapp/saved/views/my_view' \
+  --credentials user 'admin:password'
+
 # Manual key export (any endpoint)
 python splunk_ko_manager.py \
   --mode export \
@@ -55,6 +67,8 @@ python splunk_ko_manager.py \
 | `export-savedsearches` | `/saved/searches/{name}` | Local `savedsearches.conf` keys |
 | `export-props` | `/configs/conf-props/{stanza}` | Local `props.conf` keys |
 | `export-transforms` | `/configs/conf-transforms/{stanza}` | Local `transforms.conf` keys |
+| `export-macros` | `/saved/macros/{name}` or `/configs/conf-macros/{name}` | Local `macros.conf` keys |
+| `export-views` | `/saved/views/{name}`, `/data/ui/views/{name}`, or `/configs/conf-views/{name}` | Local `views.conf` keys |
 | `endpointreview` | Any REST URL | All non-null fields (discovery) |
 | `update` | Target REST URL | POST JSON from `--input` |
 | `post` | Target REST URL | POST JSON from `--input` + `--name` |
@@ -87,6 +101,12 @@ Local export [savedsearches.conf] app='recon' stanza='my_search'
 - Example stanza `[sourcetype::aws:cloudtrail]` → encode as `%5Bsourcetype%3A%3Aaws%3Acloudtrail%5D` in the endpoint URL.
 - Props often reference transforms by name — include both in migration manifests and migrate transforms before props.
 
+### Macros and views endpoint notes
+
+- **Macros:** SPL may emit `/saved/macros/{name}` or `/configs/conf-macros/{name}`.
+- **Views:** SPL may emit `/saved/views/{name}`, `/data/ui/views/{name}`, or `/configs/conf-views/{name}`.
+- View export covers **`local/views.conf` keys** only. Dashboard XML under `data/ui/views/` is separate from conf stanzas; use `endpointreview` on the `data/ui/views` URL if you need the full view body.
+
 ### Migration envelope
 
 **Stdout is always flat local key JSON** for all `export-*` modes:
@@ -108,8 +128,8 @@ Use `--migration-envelope --output manifest.json` to **additionally** write meta
 | savedsearches | `export-savedsearches` | Available |
 | props | `export-props` | Available |
 | transforms | `export-transforms` | Available |
-| macros | — | Phase 3 |
-| views | — | Phase 3 |
+| macros | `export-macros` | Available |
+| views | `export-views` | Available |
 
 ## Credentials
 

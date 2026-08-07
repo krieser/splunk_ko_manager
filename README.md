@@ -1,6 +1,6 @@
 # Splunk KO Manager
 
-CLI tool for exporting, reviewing, and updating Splunk saved searches via the REST API.
+CLI tool for exporting, reviewing, and migrating Splunk knowledge objects and `.conf` stanzas via the REST API.
 
 ## Requirements
 
@@ -20,48 +20,96 @@ pip install -r requirements.txt
 ```bash
 python splunk_ko_manager.py --version
 
-# Export specific keys (any endpoint)
+# Saved search — SPL provides KO endpoint (/saved/searches/{name})
+python splunk_ko_manager.py \
+  --mode export-savedsearches \
+  --endpoint 'https://127.0.0.1:8089/servicesNS/nobody/recon/saved/searches/my_search' \
+  --credentials user 'admin:password'
+
+# Props — SPL provides conf endpoint (/configs/conf-props/{stanza})
+python splunk_ko_manager.py \
+  --mode export-props \
+  --endpoint 'https://127.0.0.1:8089/servicesNS/nobody/myapp/configs/conf-props/sourcetype%3A%3Aaws%3Acloudtrail' \
+  --credentials user 'admin:password' \
+  --migration-envelope
+
+# Transforms — SPL provides conf endpoint (/configs/conf-transforms/{stanza})
+python splunk_ko_manager.py \
+  --mode export-transforms \
+  --endpoint 'https://127.0.0.1:8089/servicesNS/nobody/myapp/configs/conf-transforms/my_transform' \
+  --credentials user 'admin:password'
+
+# Manual key export (any endpoint)
 python splunk_ko_manager.py \
   --mode export \
   --endpoint 'https://127.0.0.1:8089/servicesNS/nobody/recon/saved/searches/my_search' \
   --credentials user 'admin:password' \
   --keys 'search,cron_schedule,description'
-
-# Export only keys defined in local/savedsearches.conf (no --keys required)
-python splunk_ko_manager.py \
-  --mode export-savedsearches \
-  --endpoint 'https://127.0.0.1:8089/servicesNS/nobody/recon/saved/searches/my_search' \
-  --credentials user 'admin:password'
-
-# Write JSON to a file
-python splunk_ko_manager.py \
-  --mode export-savedsearches \
-  --endpoint 'https://127.0.0.1:8089/servicesNS/nobody/recon/saved/searches/my_search' \
-  --credentials user 'admin:password' \
-  --output my_search.local.json
-
-# Dump all non-null REST fields (discovery / troubleshooting)
-python splunk_ko_manager.py \
-  --mode endpointreview \
-  --endpoint 'https://127.0.0.1:8089/servicesNS/nobody/recon/saved/searches/my_search' \
-  --credentials user 'admin:password'
 ```
 
 ## Modes
 
-| Mode | Description |
-|------|-------------|
-| `export` | Export an explicit comma-separated key list via `--keys` from any REST endpoint |
-| `export-savedsearches` | Export keys defined in `local/savedsearches.conf` for one saved search (REST discovery; no `--keys`) |
-| `endpointreview` | List all non-null fields returned by the endpoint |
-| `update` | POST a JSON payload from `--input` |
-| `post` | Create/update with `--input` and `--name` |
+| Mode | Endpoint format | Description |
+|------|-----------------|-------------|
+| `export` | Any REST URL | Export explicit `--keys` list |
+| `export-savedsearches` | `/saved/searches/{name}` | Local `savedsearches.conf` keys |
+| `export-props` | `/configs/conf-props/{stanza}` | Local `props.conf` keys |
+| `export-transforms` | `/configs/conf-transforms/{stanza}` | Local `transforms.conf` keys |
+| `endpointreview` | Any REST URL | All non-null fields (discovery) |
+| `update` | Target REST URL | POST JSON from `--input` |
+| `post` | Target REST URL | POST JSON from `--input` + `--name` |
 
 ## Local key discovery
 
-`export-savedsearches` discovers local keys using Splunk REST only (no `btool` or filesystem access). When inherited baseline endpoints are unavailable, it falls back to `appcontext=true` discovery and filters inherited noise (for example `disabled=false`).
+All `export-*` modes export **only keys from `local/{conf_file}`** — never the full merged effective configuration.
 
-Use `--debug-local-keys` to print discovery details on stderr. JSON output remains clean on stdout.
+Discovery (stderr always logs a summary; `--debug-local-keys` adds btool validation hints):
+
+1. Fetch merged stanza and `appcontext=true` from the conf REST endpoint.
+2. Build inherited baseline (system `[default]` + app `default/` when available).
+3. Compute baseline diff; cross-check with appcontext and prefer intersection when both are trustworthy.
+4. **Reject** sets that look like merged config (≥15% of merged keys or ≥20 keys).
+5. Export values from the **conf stanza endpoint only**.
+
+Example stderr:
+
+```text
+Local export [savedsearches.conf] app='recon' stanza='my_search'
+  merged_keys=157 baseline_keys=0 baseline_diff=0 appcontext=4
+  method=appcontext local_keys=4
+  keys=['cron_schedule', 'description', 'search', 'auto_summarize.command']
+  source=REST (appcontext app-local keys)
+```
+
+### Props and transforms endpoint notes
+
+- SPL inventory searches should emit **URL-encoded** conf stanza paths.
+- Example stanza `[sourcetype::aws:cloudtrail]` → encode as `%5Bsourcetype%3A%3Aaws%3Acloudtrail%5D` in the endpoint URL.
+- Props often reference transforms by name — include both in migration manifests and migrate transforms before props.
+
+### Migration envelope
+
+**Stdout is always flat local key JSON** for all `export-*` modes:
+
+```json
+{
+  "LINE_BREAKER": "([\\r\\n]+)",
+  "NO_BINARY_CHECK": "1",
+  "category": "Custom"
+}
+```
+
+Use `--migration-envelope --output manifest.json` to **additionally** write metadata to a file. Discovery logs always go to stderr.
+
+## Conf type registry
+
+| Conf type | CLI mode | Status |
+|-----------|----------|--------|
+| savedsearches | `export-savedsearches` | Available |
+| props | `export-props` | Available |
+| transforms | `export-transforms` | Available |
+| macros | — | Phase 3 |
+| views | — | Phase 3 |
 
 ## Credentials
 

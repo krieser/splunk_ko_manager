@@ -5,6 +5,60 @@ All notable changes to `splunk_ko_manager.py` are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.3] - 2026-08-07
+
+### Fixed
+
+- **Props `pulldown_type`** — no longer filtered when `=1`; btool includes explicit local assignments even at default values.
+
+## [1.4.2] - 2026-08-07
+
+### Fixed
+
+- **`export-*` stdout is flat local key JSON only** — migration envelope writes to `--output` when requested, never replaces stdout.
+- **Props inherited noise** — filter `disabled=false` only; keep `pulldown_type=1` when present in appcontext (matches btool local/).
+- Success messages and file-write confirmations go to stderr, not stdout.
+
+## [1.4.1] - 2026-08-07
+
+### Added
+
+- **Strict local-only export** — all `export-*` modes reject candidate key sets that look like merged effective config.
+- **Baseline ∩ appcontext cross-check** — local keys require agreement when both discovery paths are available.
+- **Always-on local discovery logging** — stderr summary for every `export-*` run; `--debug-local-keys` adds btool validation hints.
+- **`discovery_method` field** in migration envelope.
+
+### Changed
+
+- Local export values always fetched from `configs/conf-*` stanza endpoints, not KO collection URLs.
+- Local export output omits null/missing keys; only discovered local keys with values are written.
+
+## [1.4.0] - 2026-08-07
+
+### Added
+
+- **`export-props` mode** — export locally-defined keys from `props.conf` stanzas via REST.
+- **`export-transforms` mode** — export locally-defined keys from `transforms.conf` stanzas via REST.
+
+### Changed
+
+- Conf-only export modes use `/configs/conf-{type}/{stanza}` endpoints (URL-encoded stanzas supported).
+- 404 errors include mode-specific endpoint format hints.
+
+## [1.3.0] - 2026-08-07
+
+### Added
+
+- **`ConfTypeSpec` registry** — conf-type metadata for savedsearches and future types (props, transforms, macros, views).
+- **Generic local conf discovery** — `discover_local_conf_keys()` replaces savedsearches-specific logic.
+- **`--migration-envelope`** — optional migration JSON wrapper for local export output.
+- **`run_export_local()`** — shared export path for all future `export-*` local modes.
+
+### Changed
+
+- Savedsearch export behavior unchanged by default (flat JSON without `--migration-envelope`).
+- Discovery, baseline fetch, and appcontext filtering driven by registry per conf type.
+
 ## [1.2.0] - 2026-08-06
 
 ### Added
@@ -47,5 +101,10 @@ First official release of the Splunk Knowledge Object Manager CLI.
 - Export output uses legible JSON (`indent=2`, sorted keys, UTF-8).
 - `endpointreview` filters out `null` values recursively before printing.
 
+[1.4.3]: #
+[1.4.2]: #
+[1.4.1]: #
+[1.4.0]: #
+[1.3.0]: #
 [1.2.0]: #
 [1.0.0]: #

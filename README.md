@@ -68,7 +68,7 @@ python splunk_ko_manager.py \
 | `export-props` | `/configs/conf-props/{stanza}` | Local `props.conf` keys |
 | `export-transforms` | `/configs/conf-transforms/{stanza}` | Local `transforms.conf` keys |
 | `export-macros` | `/saved/macros/{name}` or `/configs/conf-macros/{name}` | Local `macros.conf` keys |
-| `export-views` | `/saved/views/{name}`, `/data/ui/views/{name}`, or `/configs/conf-views/{name}` | Local `views.conf` keys |
+| `export-views` | `/saved/views/{name}`, `/data/ui/views/{name}`, or `/configs/conf-views/{name}` | Local-only dashboard XML (`eai:data`) from `local/data/ui/views/` |
 | `endpointreview` | Any REST URL | All non-null fields (discovery) |
 | `update` | Target REST URL | POST JSON from `--input` |
 | `post` | Target REST URL | POST JSON from `--input` + `--name` |
@@ -104,8 +104,47 @@ Local export [savedsearches.conf] app='recon' stanza='my_search'
 ### Macros and views endpoint notes
 
 - **Macros:** SPL may emit `/saved/macros/{name}` or `/configs/conf-macros/{name}`.
-- **Views:** SPL may emit `/saved/views/{name}`, `/data/ui/views/{name}`, or `/configs/conf-views/{name}`.
-- View export covers **`local/views.conf` keys** only. Dashboard XML under `data/ui/views/` is separate from conf stanzas; use `endpointreview` on the `data/ui/views` URL if you need the full view body.
+- **Views:** SPL may emit `/saved/views/{name}`, `/data/ui/views/{name}`, or `/configs/conf-views/{name}`. Export resolves to **`data/ui/views`**, verifies the dashboard exists in a **`local/data/ui/views/`** layer (REST-only), then returns **`eai:data`**. App-shipped **`default/data/ui/views/`** dashboards are **rejected**.
+
+**Local view discovery (stderr; `--debug-local-keys` adds filesystem validation hints):**
+
+1. Prefer `appcontext=true` / `defaultcontext=true` when Splunk supports them on `data/ui/views`.
+2. Otherwise use `local.meta` stanza probes (`[views/{name}]`) and REST entry path hints.
+3. Reject when no local layer can be confirmed (likely `default/data/ui/views/` only).
+
+Example stderr:
+
+```text
+View export [local/data/ui/views] app='recon' owner='nobody' view='my_dashboard'
+  effective=true appcontext=true defaultcontext=true
+  method=appcontext source=REST (appcontext local/data/ui/views)
+  xml_bytes=4821
+```
+
+**View migration workflow:**
+
+```bash
+# Export (source)
+python splunk_ko_manager.py --mode export-views \
+  --endpoint 'https://127.0.0.1:8089/servicesNS/nobody/myapp/saved/views/my_dashboard' \
+  --credentials user 'admin:password' \
+  --output my_dashboard.json
+
+# Update existing view (target)
+python splunk_ko_manager.py --mode update \
+  --endpoint 'https://target:8089/servicesNS/nobody/myapp/data/ui/views/my_dashboard' \
+  --credentials user 'admin:password' \
+  --input my_dashboard.json
+
+# Create new view (target) — POST needs collection URL + --name
+python splunk_ko_manager.py --mode post \
+  --endpoint 'https://target:8089/servicesNS/nobody/myapp/data/ui/views' \
+  --credentials user 'admin:password' \
+  --name my_dashboard \
+  --input my_dashboard.json
+```
+
+The export JSON includes `eai:data` (required) and `name`. Dashboard title/description are inside the XML. On `update`/`post` to `data/ui/views`, unsupported fields like `label` are stripped automatically.
 
 ### Migration envelope
 

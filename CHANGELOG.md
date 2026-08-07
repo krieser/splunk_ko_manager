@@ -10,8 +10,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **`export-macros` mode** — export locally-defined keys from `macros.conf` via `/saved/macros/{name}` or `/configs/conf-macros/{name}`.
-- **`export-views` mode** — export locally-defined keys from `views.conf` via `/saved/views/{name}`, `/data/ui/views/{name}`, or `/configs/conf-views/{name}`.
+- **`export-views` mode** — export local-only dashboard XML/definition via `data/ui/views` (`eai:data`); rejects `default/data/ui/views/` dashboards.
 - Direct **`configs/conf-*`** URL support for KO types (macros, saved searches) in addition to KO collection URLs.
+
+### Changed
+
+- **`export-views`** fetches dashboard XML from `data/ui/views` instead of local `views.conf` keys (dashboards are stored as XML/JSON files, not conf stanzas).
+- **`export-views`** exports **local-only** dashboards (`local/data/ui/views/`) and rejects app-shipped `default/` views.
+- **View `update`/`post`** strips unsupported fields (`label`, `description`, etc.); Splunk accepts only `eai:data` and `name` (post).
 
 ## [1.4.3] - 2026-08-07
 

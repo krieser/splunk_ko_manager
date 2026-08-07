@@ -22,6 +22,14 @@ MIGRATION_ENVELOPE_VERSION = "1"
 _DATA_UI_VIEWS_RE = re.compile(
     r"/servicesNS/([^/]+)/([^/]+)/data/ui/views/([^/?#]+)/?$"
 )
+_SAVED_VIEWS_RE = re.compile(
+    r"/servicesNS/([^/]+)/([^/]+)/saved/views/([^/?#]+)/?$"
+)
+_CONF_VIEWS_RE = re.compile(
+    r"/servicesNS/([^/]+)/([^/]+)/configs/conf-views/([^/?#]+)/?$"
+)
+VIEW_EXPORT_MODE = "export-views"
+VIEW_MIGRATION_FIELDS = ("name", "eai:data")
 _MISSING = object()
 _DEFAULT_METADATA_PREFIXES = ("eai:",)
 # Reject candidate local-key sets that look like merged effective config, not local/.
@@ -122,14 +130,6 @@ CONF_TYPE_REGISTRY: Dict[str, ConfTypeSpec] = {
         ko_collection="saved/macros",
         inherited_noise_keys=frozenset({"disabled"}),
     ),
-    "views": _spec(
-        "views",
-        "views.conf",
-        "conf-views",
-        "views",
-        ko_collection="saved/views",
-        inherited_noise_keys=frozenset({"disabled"}),
-    ),
 }
 
 EXPORT_MODE_TO_CONF_TYPE: Dict[str, str] = {
@@ -137,7 +137,6 @@ EXPORT_MODE_TO_CONF_TYPE: Dict[str, str] = {
     "export-props": "props",
     "export-transforms": "transforms",
     "export-macros": "macros",
-    "export-views": "views",
 }
 
 
@@ -173,6 +172,322 @@ def parse_data_ui_views_endpoint(endpoint: str) -> Optional[Tuple[str, str, str]
         return None
     owner, app, view_name = match.groups()
     return unquote(owner), unquote(app), unquote(view_name)
+
+
+def build_data_ui_views_url(
+    origin: str,
+    owner: str,
+    app: str,
+    view_name: str,
+) -> str:
+    owner = normalize_conf_owner(owner)
+    path = (
+        f"/servicesNS/{quote(owner, safe='')}/{quote(app, safe='')}"
+        f"/data/ui/views/{quote(view_name, safe='')}"
+    )
+    parsed = urlparse(origin if "://" in origin else f"https://{origin}")
+    if "://" in origin:
+        return urlunparse((parsed.scheme, parsed.netloc, path, "", "", ""))
+    return path
+
+
+def resolve_view_export_context(
+    endpoint: str,
+) -> Optional[Tuple[str, str, str, str]]:
+    """
+    Resolve owner, app, view name, and data/ui/views REST URL for view export.
+
+    Accepts saved/views, data/ui/views, or configs/conf-views URLs from SPL inventory.
+    """
+    parsed = urlparse(endpoint)
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    path = parsed.path
+
+    for pattern in (_DATA_UI_VIEWS_RE, _SAVED_VIEWS_RE, _CONF_VIEWS_RE):
+        match = pattern.search(path)
+        if match:
+            owner, app, view_name = match.groups()
+            owner, app, view_name = unquote(owner), unquote(app), unquote(view_name)
+            return (
+                owner,
+                app,
+                view_name,
+                build_data_ui_views_url(origin, owner, app, view_name),
+            )
+    return None
+
+
+@dataclass
+class ViewDiscoveryResult:
+    """Outcome of REST local-view discovery for one dashboard."""
+
+    is_local: bool
+    source: str
+    method: str
+    entry: Optional[dict]
+    rejected_reason: Optional[str] = None
+    appcontext_present: bool = False
+    defaultcontext_present: bool = False
+    effective_present: bool = False
+
+
+def is_user_namespace_owner(owner: str) -> bool:
+    return owner not in ("-", "nobody")
+
+
+def normalize_view_xml(value: str) -> str:
+    return str(value).replace("\r\n", "\n").strip()
+
+
+def view_meta_stanza_candidates(view_name: str) -> List[str]:
+    return [
+        f"views/{view_name}",
+        f"[views/{view_name}]",
+    ]
+
+
+def entry_indicates_local_view_path(entry: Optional[dict]) -> bool:
+    if not entry:
+        return False
+    blob = json.dumps(entry, default=str).lower()
+    return "local/data/ui/views/" in blob or "local\\data\\ui\\views\\" in blob
+
+
+def probe_local_meta_view_stanza(
+    origin: str,
+    app: str,
+    view_name: str,
+    auth,
+    headers: dict,
+    debug: bool = False,
+) -> bool:
+    """Return True when local.meta appears to define this view stanza."""
+    for stanza in view_meta_stanza_candidates(view_name):
+        bracket_stanza = stanza
+        if not (stanza.startswith("[") and stanza.endswith("]")):
+            bracket_stanza = f"[{stanza}]"
+        for encoded_stanza in {stanza, bracket_stanza}:
+            url = (
+                f"{origin}/servicesNS/nobody/{quote(app, safe='')}"
+                f"/configs/conf-local.meta/{quote(encoded_stanza, safe='')}"
+            )
+            entry = fetch_rest_entry(url, auth, headers, optional=True)
+            if entry:
+                if debug:
+                    print(f"Debug: local.meta stanza found at {url}", file=sys.stderr)
+                return True
+    return False
+
+
+def fetch_view_layer_entry(
+    data_ui_views_url: str,
+    auth,
+    headers: dict,
+    layer_param: Optional[str],
+    debug: bool = False,
+) -> Tuple[Optional[dict], Optional[str]]:
+    """
+    Try appcontext/defaultcontext layer probes on data/ui/views.
+
+    Splunk often returns 400 for these params on view endpoints (conf-only feature).
+    """
+    if not layer_param:
+        return fetch_rest_entry(data_ui_views_url, auth, headers, optional=True), None
+
+    params = {layer_param: "true"}
+    entry = fetch_rest_entry(
+        data_ui_views_url,
+        auth,
+        headers,
+        params=params,
+        optional=True,
+    )
+    if entry:
+        return entry, layer_param
+
+    if debug:
+        print(
+            f"Debug: {layer_param}=true unsupported or empty for {data_ui_views_url}",
+            file=sys.stderr,
+        )
+    return None, f"{layer_param}_unsupported"
+
+
+def extract_view_eai_data(entry: Optional[dict]) -> Optional[str]:
+    if not entry:
+        return None
+    content = normalize_content(entry.get("content", {}))
+    data = content.get("eai:data")
+    if data is None:
+        candidate = get_field_value(entry, "eai:data")
+        if candidate is not _MISSING:
+            data = candidate
+    if data is None:
+        return None
+    return str(data)
+
+
+def discover_local_view(
+    data_ui_views_url: str,
+    owner: str,
+    app: str,
+    view_name: str,
+    origin: str,
+    auth,
+    headers: dict,
+    debug: bool = False,
+) -> Optional[ViewDiscoveryResult]:
+    """
+    Determine whether a dashboard exists in a local/data/ui/views layer.
+
+    data/ui/views does not support configs-style appcontext/defaultcontext on all
+    Splunk versions (often HTTP 400). When those probes are unavailable, fall back
+    to local.meta stanza detection and REST entry path hints.
+    """
+    effective_entry, _ = fetch_view_layer_entry(
+        data_ui_views_url, auth, headers, None, debug=debug
+    )
+    effective_data = extract_view_eai_data(effective_entry)
+
+    appcontext_entry, appcontext_status = fetch_view_layer_entry(
+        data_ui_views_url, auth, headers, "appcontext", debug=debug
+    )
+    appcontext_data = extract_view_eai_data(appcontext_entry)
+
+    defaultcontext_entry, defaultcontext_status = fetch_view_layer_entry(
+        data_ui_views_url, auth, headers, "defaultcontext", debug=debug
+    )
+    defaultcontext_data = extract_view_eai_data(defaultcontext_entry)
+
+    appcontext_present = bool(appcontext_data)
+    defaultcontext_present = bool(defaultcontext_data)
+    effective_present = bool(effective_data)
+    local_meta_present = probe_local_meta_view_stanza(
+        origin, app, view_name, auth, headers, debug=debug
+    )
+    entry_local_hint = entry_indicates_local_view_path(effective_entry)
+
+    if debug:
+        print(
+            f"Debug view discovery [{view_name}]: effective={effective_present} "
+            f"appcontext={appcontext_present} defaultcontext={defaultcontext_present} "
+            f"local_meta={local_meta_present} entry_local_hint={entry_local_hint}",
+            file=sys.stderr,
+        )
+
+    if not effective_present and not appcontext_present:
+        return None
+
+    if appcontext_present:
+        return ViewDiscoveryResult(
+            is_local=True,
+            source="REST (appcontext local/data/ui/views)",
+            method="appcontext",
+            entry=appcontext_entry or effective_entry,
+            appcontext_present=True,
+            defaultcontext_present=defaultcontext_present,
+            effective_present=effective_present,
+        )
+
+    if not effective_present:
+        return None
+
+    if defaultcontext_present:
+        if normalize_view_xml(effective_data) == normalize_view_xml(defaultcontext_data):
+            return ViewDiscoveryResult(
+                is_local=False,
+                source="REST (default/ only — matches defaultcontext)",
+                method="default_only",
+                entry=effective_entry,
+                rejected_reason=(
+                    f"view '{view_name}' exists only in default/data/ui/views/, not local/"
+                ),
+                appcontext_present=False,
+                defaultcontext_present=True,
+                effective_present=True,
+            )
+        return ViewDiscoveryResult(
+            is_local=True,
+            source="REST (local override — effective differs from defaultcontext)",
+            method="baseline_diff",
+            entry=effective_entry,
+            appcontext_present=False,
+            defaultcontext_present=True,
+            effective_present=True,
+        )
+
+    if local_meta_present or entry_local_hint:
+        return ViewDiscoveryResult(
+            is_local=True,
+            source="REST (local.meta or entry path indicates local/data/ui/views)",
+            method="local_meta" if local_meta_present else "entry_path",
+            entry=effective_entry,
+            effective_present=True,
+        )
+
+    if is_user_namespace_owner(owner):
+        nobody_url = build_data_ui_views_url(origin, "nobody", app, view_name)
+        nobody_data = extract_view_eai_data(
+            fetch_rest_entry(nobody_url, auth, headers, optional=True)
+        )
+        if nobody_data and normalize_view_xml(effective_data) == normalize_view_xml(nobody_data):
+            return ViewDiscoveryResult(
+                is_local=False,
+                source="REST (user namespace inherits app view — no local layer)",
+                method="rejected",
+                entry=effective_entry,
+                rejected_reason=(
+                    f"view '{view_name}' for user '{owner}' has no local/data/ui/views/ file "
+                    "(matches app-level effective view)"
+                ),
+                effective_present=True,
+            )
+
+    layer_note = ", ".join(
+        status
+        for status in (appcontext_status, defaultcontext_status)
+        if status and status.endswith("_unsupported")
+    )
+    suffix = f" ({layer_note})" if layer_note else ""
+    return ViewDiscoveryResult(
+        is_local=False,
+        source="REST (cannot confirm local/data/ui/views layer)",
+        method="rejected",
+        entry=effective_entry,
+        rejected_reason=(
+            f"view '{view_name}' in app '{app}' has no confirmed local/data/ui/views/ layer{suffix}; "
+            "likely default/ only. Verify with: "
+            f"ls $SPLUNK_HOME/etc/apps/{app}/local/data/ui/views/{view_name}.xml"
+        ),
+        effective_present=True,
+    )
+
+
+def log_view_discovery_report(
+    *,
+    app: str,
+    view_name: str,
+    owner: str,
+    discovery: ViewDiscoveryResult,
+    verbose: bool = False,
+) -> None:
+    print(
+        f"View export [local/data/ui/views] app='{app}' owner='{owner}' view='{view_name}'",
+        file=sys.stderr,
+    )
+    print(
+        f"  effective={discovery.effective_present} "
+        f"appcontext={discovery.appcontext_present} "
+        f"defaultcontext={discovery.defaultcontext_present}",
+        file=sys.stderr,
+    )
+    print(f"  method={discovery.method} source={discovery.source}", file=sys.stderr)
+    if verbose:
+        print(
+            f"  Validate: ls $SPLUNK_HOME/etc/apps/{app}/local/data/ui/views/{view_name}.xml "
+            f"(app-local) or etc/users/{owner}/{app}/local/data/ui/views/ (user-local)",
+            file=sys.stderr,
+        )
 
 
 def parse_ko_endpoint(endpoint: str, spec: ConfTypeSpec) -> Optional[Tuple[str, str, str]]:
@@ -228,12 +543,10 @@ def build_conf_endpoint_from_ko(
     app: Optional[str] = None,
     stanza_name: Optional[str] = None,
 ) -> Optional[str]:
-    """Build configs/conf-* endpoint from a KO or data/ui/views URL."""
+    """Build configs/conf-* endpoint from a KO URL."""
     parsed = urlparse(endpoint)
     if owner is None or app is None or stanza_name is None:
         parts = parse_ko_endpoint(endpoint, spec)
-        if not parts and spec.name == "views":
-            parts = parse_data_ui_views_endpoint(endpoint)
         if not parts:
             return None
         owner, app, stanza_name = parts
@@ -273,8 +586,7 @@ def resolve_local_export_context(
     """
     Resolve owner, app, stanza, and conf REST endpoint for local export.
 
-    Accepts KO endpoints (saved/*), direct configs/conf-* URLs, or for views
-    also data/ui/views/{name}.
+    Accepts KO endpoints (saved/*) or direct configs/conf-* URLs.
     """
     conf_parts = parse_conf_endpoint(endpoint, spec)
     if conf_parts:
@@ -283,8 +595,6 @@ def resolve_local_export_context(
 
     if spec.ko_collection:
         parts = parse_ko_endpoint(endpoint, spec)
-        if not parts and spec.name == "views":
-            parts = parse_data_ui_views_endpoint(endpoint)
         if not parts:
             return None
         owner, app, stanza_name = parts
@@ -335,6 +645,7 @@ def splunk_get_json(
     params: Optional[dict] = None,
     *,
     optional: bool = False,
+    optional_statuses: Tuple[int, ...] = (404, 400),
 ) -> Optional[dict]:
     """GET a Splunk REST endpoint and return parsed JSON."""
     request_params = {"output_mode": "json"}
@@ -347,7 +658,7 @@ def splunk_get_json(
         params=request_params,
         verify=False,
     )
-    if optional and response.status_code == 404:
+    if optional and response.status_code in optional_statuses:
         return None
     response.raise_for_status()
     return response.json()
@@ -877,6 +1188,83 @@ def build_migration_envelope(
     }
 
 
+def build_view_migration_envelope(
+    *,
+    endpoint: str,
+    owner: str,
+    app: str,
+    view_name: str,
+    data_ui_views_url: str,
+    content: dict,
+    discovery_source: str,
+    discovery_method: str,
+) -> dict:
+    parsed = urlparse(endpoint)
+    return {
+        "migration_version": MIGRATION_ENVELOPE_VERSION,
+        "tool_version": __version__,
+        "conf_type": "views",
+        "source": {
+            "host": parsed.netloc,
+            "endpoint": endpoint,
+            "data_ui_views_url": data_ui_views_url,
+            "owner": owner,
+            "app": app,
+        },
+        "view_name": view_name,
+        "discovery_source": discovery_source,
+        "discovery_method": discovery_method,
+        "content": content,
+    }
+
+
+def build_view_export_payload(entry: dict) -> dict:
+    """Build migration JSON for a dashboard view (XML in eai:data).
+
+    Splunk data/ui/views POST accepts only name and eai:data; label/description
+    live inside the XML body.
+    """
+    content = normalize_content(entry.get("content", {}))
+    entry_fields = {k: v for k, v in entry.items() if k not in ("content", "links")}
+    lookup_sources = (content, entry_fields, entry)
+    out = {}
+
+    for key in VIEW_MIGRATION_FIELDS:
+        value = _MISSING
+        for source in lookup_sources:
+            candidate_value = get_field_value(source, key)
+            if candidate_value is not _MISSING:
+                value = candidate_value
+                break
+        if value is not _MISSING and value is not None:
+            out[key] = value
+
+    if "name" not in out and entry.get("name"):
+        out["name"] = entry["name"]
+
+    return out
+
+
+def is_data_ui_views_endpoint(endpoint: str) -> bool:
+    return "/data/ui/views" in urlparse(endpoint).path
+
+
+def sanitize_view_post_payload(payload: dict, mode: str) -> dict:
+    """Keep only fields Splunk accepts on data/ui/views POST handlers."""
+    if "eai:data" not in payload:
+        return payload
+    sanitized = {"eai:data": payload["eai:data"]}
+    if mode == "post" and payload.get("name"):
+        sanitized["name"] = payload["name"]
+    dropped = sorted(key for key in payload if key not in sanitized)
+    if dropped:
+        print(
+            f"Note: dropped unsupported data/ui/views POST fields: {dropped}",
+            file=sys.stderr,
+        )
+    return sanitized
+
+
 def normalize_content(content) -> dict:
     if isinstance(content, dict):
         return content
@@ -1096,16 +1484,16 @@ def run_export(args, auth, headers) -> None:
 
 def endpoint_hint_for_mode(mode: str) -> str:
     """Return a one-line endpoint format hint for CLI errors."""
+    if mode == VIEW_EXPORT_MODE:
+        return (
+            "/servicesNS/{owner}/{app}/saved/views/{name} or "
+            "/servicesNS/{owner}/{app}/data/ui/views/{name} or "
+            "/servicesNS/{owner}/{app}/configs/conf-views/{name}"
+        )
     conf_type_name = EXPORT_MODE_TO_CONF_TYPE.get(mode)
     if not conf_type_name:
         return "/servicesNS/{owner}/{app}/..."
     spec = CONF_TYPE_REGISTRY[conf_type_name]
-    if spec.name == "views":
-        return (
-            f"/servicesNS/{{owner}}/{{app}}/{spec.ko_collection}/{{name}} or "
-            f"/servicesNS/{{owner}}/{{app}}/data/ui/views/{{name}} or "
-            f"/servicesNS/{{owner}}/{{app}}/configs/{spec.conf_rest}/{{stanza}}"
-        )
     if spec.ko_collection:
         return (
             f"/servicesNS/{{owner}}/{{app}}/{spec.ko_collection}/{{name}} or "
@@ -1210,6 +1598,107 @@ def run_export_local(spec: ConfTypeSpec, args, auth, headers) -> None:
         )
 
 
+def run_export_view(args, auth, headers) -> None:
+    """Export local-only dashboard XML (eai:data) from data/ui/views for migration."""
+    ctx = resolve_view_export_context(args.endpoint)
+    if not ctx:
+        print(
+            f"Error: {VIEW_EXPORT_MODE} requires a saved/views, data/ui/views, "
+            "or configs/conf-views endpoint.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    owner, app, view_name, data_ui_views_url = ctx
+    origin = conf_server_origin(data_ui_views_url)
+
+    discovery = discover_local_view(
+        data_ui_views_url,
+        owner,
+        app,
+        view_name,
+        origin,
+        auth,
+        headers,
+        debug=args.debug_local_keys,
+    )
+
+    if discovery is None:
+        print(
+            f"Error: view '{view_name}' not found in app '{app}' "
+            f"at {data_ui_views_url}.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    log_view_discovery_report(
+        app=app,
+        view_name=view_name,
+        owner=owner,
+        discovery=discovery,
+        verbose=args.debug_local_keys,
+    )
+
+    if not discovery.is_local:
+        print(
+            f"Error: view '{view_name}' in app '{app}' is not a local dashboard: "
+            f"{discovery.rejected_reason or discovery.source}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if not discovery.entry:
+        print(
+            f"Error: local view discovery returned no REST entry for '{view_name}'.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    payload = build_view_export_payload(discovery.entry)
+
+    if not payload.get("eai:data"):
+        print(
+            f"Error: local view '{view_name}' in app '{app}' has no eai:data (dashboard XML).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    xml_bytes = len(str(payload["eai:data"]).encode("utf-8"))
+    print(f"  xml_bytes={xml_bytes}", file=sys.stderr)
+
+    if args.migration_envelope:
+        if not args.output:
+            print(
+                "Warning: --migration-envelope requires --output; "
+                "writing flat view JSON to stdout only.",
+                file=sys.stderr,
+            )
+            write_json_output(payload, None)
+        else:
+            envelope = build_view_migration_envelope(
+                endpoint=args.endpoint,
+                owner=owner,
+                app=app,
+                view_name=view_name,
+                data_ui_views_url=data_ui_views_url,
+                content=payload,
+                discovery_source=discovery.source,
+                discovery_method=discovery.method,
+            )
+            write_json_output(payload, None)
+            write_json_output(
+                envelope,
+                args.output,
+                f"Successfully wrote migration envelope to '{{}}'",
+            )
+    else:
+        write_json_output(
+            payload,
+            args.output,
+            f"Successfully exported local dashboard XML for view '{view_name}' to '{{}}'",
+        )
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Splunk Knowledge Object Manager — export, review, update, and post via REST.",
@@ -1218,7 +1707,14 @@ def main():
     parser.add_argument(
         "--mode",
         required=True,
-        choices=["export", *EXPORT_MODE_TO_CONF_TYPE.keys(), "endpointreview", "update", "post"],
+        choices=[
+            "export",
+            *EXPORT_MODE_TO_CONF_TYPE.keys(),
+            VIEW_EXPORT_MODE,
+            "endpointreview",
+            "update",
+            "post",
+        ],
     )
     parser.add_argument("--endpoint", required=True, help="The Splunk REST endpoint URL.")
     parser.add_argument("--credentials", required=True, nargs=2, metavar=('{user,token}', 'VALUE'))
@@ -1266,10 +1762,13 @@ def main():
                 print("Error: --name is required when using '--mode post'")
                 sys.exit(1)
             payload["name"] = args.name
+        if is_data_ui_views_endpoint(args.endpoint):
+            payload = sanitize_view_post_payload(payload, args.mode)
 
     local_export_modes = set(EXPORT_MODE_TO_CONF_TYPE.keys())
+    export_modes = local_export_modes | {VIEW_EXPORT_MODE}
     if args.dry_run:
-        method = "GET" if args.mode in ("export", *local_export_modes, "endpointreview") else "POST"
+        method = "GET" if args.mode in ("export", *export_modes, "endpointreview") else "POST"
         print(f"\n--- DRY RUN: Equivalent Curl Command for {args.mode.upper()} ---")
         print(generate_curl_dry_run(method, args.endpoint, auth, headers, payload))
         if args.mode == "export":
@@ -1280,6 +1779,12 @@ def main():
             conf_type = EXPORT_MODE_TO_CONF_TYPE[args.mode]
             print(
                 f"\nNOTE: Live run discovers local {CONF_TYPE_REGISTRY[conf_type].conf_file} keys via REST "
+                f"and writes JSON to: {dest}\n"
+            )
+        elif args.mode == VIEW_EXPORT_MODE:
+            dest = args.output if args.output else "STDOUT"
+            print(
+                f"\nNOTE: Live run discovers local/data/ui/views XML via REST "
                 f"and writes JSON to: {dest}\n"
             )
         elif args.mode == "endpointreview":
@@ -1294,6 +1799,9 @@ def main():
         elif args.mode in local_export_modes:
             conf_type_name = EXPORT_MODE_TO_CONF_TYPE[args.mode]
             run_export_local(get_conf_type(conf_type_name), args, auth, headers)
+
+        elif args.mode == VIEW_EXPORT_MODE:
+            run_export_view(args, auth, headers)
 
         elif args.mode == "endpointreview":
             target_entry = fetch_target_entry(args.endpoint, auth, headers)

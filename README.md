@@ -95,6 +95,41 @@ Local export [savedsearches.conf] app='recon' stanza='my_search'
   source=REST (appcontext app-local keys)
 ```
 
+## Default-layer export (`--default_only`)
+
+Use **`--default_only`** with any **`export-*`** mode to export the app **`default/`** layer instead of `local/`. Does **not** apply to `export`, `update`, `post`, or `endpointreview`.
+
+| Behavior | Default (local export) | `--default_only` |
+|----------|------------------------|------------------|
+| Conf keys | `appcontext=true` / baseline diff | `defaultonly=true` (falls back to `defaultcontext` on older builds) |
+| Default-only stanzas | **Rejected** (no output; use `--default_only`) | Exported |
+| Local keys | Exported | **Suppressed** (listed in stderr as `local_only_suppressed`) |
+| Views | `local/data/ui/views/` XML | `default/data/ui/views/` XML; local overrides suppressed |
+| Inventory | Per stanza | Also logs `default_collection_stanzas` — all stanzas in app default/ for that conf type |
+
+```bash
+# Shipped props stanza from app default/
+python splunk_ko_manager.py --mode export-props --default_only \
+  --endpoint 'https://127.0.0.1:8089/servicesNS/nobody/SA-NetworkProtection/configs/conf-props/firewall' \
+  --credentials user 'admin:password'
+
+# Shipped ES dashboard from default/data/ui/views/
+python splunk_ko_manager.py --mode export-views --default_only \
+  --endpoint 'https://127.0.0.1:8089/servicesNS/nobody/SplunkEnterpriseSecuritySuite/data/ui/views/aaa' \
+  --credentials user 'admin:password' \
+  --output aaa_default.json
+```
+
+Example stderr (conf):
+
+```text
+Default export [props.conf] app='myapp' stanza='firewall'
+  merged_keys=42 default_layer_keys=12 appcontext_suppressed=3 local_only_suppressed=3
+  method=defaultonly default_keys=12 default_collection_stanzas=847
+  keys=['TRANSFORMS', 'SHOULD_LINEMERGE', ...]
+  suppressed_local_only_keys=['description']
+```
+
 ### Props and transforms endpoint notes
 
 - SPL inventory searches should emit **URL-encoded** conf stanza paths.

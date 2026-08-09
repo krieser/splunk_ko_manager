@@ -16,7 +16,7 @@ import urllib3
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-__version__ = "1.5.0"
+__version__ = "1.6.0"
 MIGRATION_ENVELOPE_VERSION = "1"
 
 _DATA_UI_VIEWS_RE = re.compile(
@@ -76,6 +76,36 @@ class LocalDiscoveryResult:
     baseline_diff_keys: List[str]
     appcontext_keys: List[str]
     rejected_reason: Optional[str] = None
+
+
+@dataclass
+class DefaultDiscoveryResult:
+    """Outcome of REST default-layer discovery for one conf stanza."""
+
+    default_keys: List[str]
+    source: str
+    method: str
+    merged_key_count: int
+    default_key_count: int
+    appcontext_keys: List[str]
+    local_only_keys: List[str]
+    default_collection_stanzas: List[str]
+    rejected_reason: Optional[str] = None
+
+
+@dataclass
+class DefaultViewDiscoveryResult:
+    """Outcome of REST default-layer discovery for one dashboard view."""
+
+    is_default: bool
+    source: str
+    method: str
+    entry: Optional[dict]
+    rejected_reason: Optional[str] = None
+    defaultcontext_present: bool = False
+    appcontext_present: bool = False
+    effective_present: bool = False
+    local_override: bool = False
 
 
 def _spec(
@@ -463,6 +493,107 @@ def discover_local_view(
     )
 
 
+def discover_default_view(
+    data_ui_views_url: str,
+    owner: str,
+    app: str,
+    view_name: str,
+    auth,
+    headers: dict,
+    debug: bool = False,
+) -> Optional[DefaultViewDiscoveryResult]:
+    """
+    Determine whether a dashboard exists in default/data/ui/views and export that layer.
+
+    Local/appcontext overrides are detected and suppressed from export.
+    """
+    effective_entry, _ = fetch_view_layer_entry(
+        data_ui_views_url, auth, headers, None, debug=debug
+    )
+    effective_data = extract_view_eai_data(effective_entry)
+
+    appcontext_entry, _ = fetch_view_layer_entry(
+        data_ui_views_url, auth, headers, "appcontext", debug=debug
+    )
+    appcontext_data = extract_view_eai_data(appcontext_entry)
+
+    defaultcontext_entry, defaultcontext_status = fetch_view_layer_entry(
+        data_ui_views_url, auth, headers, "defaultcontext", debug=debug
+    )
+    defaultcontext_data = extract_view_eai_data(defaultcontext_entry)
+
+    appcontext_present = bool(appcontext_data)
+    defaultcontext_present = bool(defaultcontext_data)
+    effective_present = bool(effective_data)
+    local_override = bool(
+        appcontext_present
+        and defaultcontext_present
+        and normalize_view_xml(appcontext_data) != normalize_view_xml(defaultcontext_data)
+    )
+
+    if debug:
+        print(
+            f"Debug default view discovery [{view_name}]: effective={effective_present} "
+            f"defaultcontext={defaultcontext_present} appcontext={appcontext_present} "
+            f"local_override={local_override}",
+            file=sys.stderr,
+        )
+
+    if defaultcontext_present:
+        return DefaultViewDiscoveryResult(
+            is_default=True,
+            source="REST (defaultcontext default/data/ui/views)",
+            method="defaultcontext",
+            entry=defaultcontext_entry,
+            defaultcontext_present=True,
+            appcontext_present=appcontext_present,
+            effective_present=effective_present,
+            local_override=local_override,
+        )
+
+    if appcontext_present and not defaultcontext_present:
+        return DefaultViewDiscoveryResult(
+            is_default=False,
+            source="REST (local-only view — no default/ layer)",
+            method="rejected",
+            entry=effective_entry,
+            rejected_reason=(
+                f"view '{view_name}' in app '{app}' has local/data/ui/views/ content "
+                "but no default/ layer via REST"
+            ),
+            appcontext_present=True,
+            effective_present=effective_present,
+        )
+
+    if effective_present and not appcontext_present:
+        return DefaultViewDiscoveryResult(
+            is_default=True,
+            source="REST (effective view; no local override detected)",
+            method="effective_as_default",
+            entry=effective_entry,
+            defaultcontext_present=False,
+            appcontext_present=False,
+            effective_present=True,
+        )
+
+    layer_note = (
+        f" ({defaultcontext_status})"
+        if defaultcontext_status and defaultcontext_status.endswith("_unsupported")
+        else ""
+    )
+    return DefaultViewDiscoveryResult(
+        is_default=False,
+        source="REST (cannot confirm default/data/ui/views layer)",
+        method="rejected",
+        entry=effective_entry,
+        rejected_reason=(
+            f"view '{view_name}' in app '{app}' has no confirmed default/data/ui/views/ layer"
+            f"{layer_note}"
+        ),
+        effective_present=effective_present,
+    )
+
+
 def log_view_discovery_report(
     *,
     app: str,
@@ -486,6 +617,36 @@ def log_view_discovery_report(
         print(
             f"  Validate: ls $SPLUNK_HOME/etc/apps/{app}/local/data/ui/views/{view_name}.xml "
             f"(app-local) or etc/users/{owner}/{app}/local/data/ui/views/ (user-local)",
+            file=sys.stderr,
+        )
+
+
+def log_default_view_discovery_report(
+    *,
+    app: str,
+    view_name: str,
+    owner: str,
+    discovery: DefaultViewDiscoveryResult,
+    verbose: bool = False,
+) -> None:
+    print(
+        f"Default view export [default/data/ui/views] app='{app}' "
+        f"owner='{owner}' view='{view_name}'",
+        file=sys.stderr,
+    )
+    print(
+        f"  effective={discovery.effective_present} "
+        f"defaultcontext={discovery.defaultcontext_present} "
+        f"appcontext_suppressed={discovery.appcontext_present} "
+        f"local_override={discovery.local_override}",
+        file=sys.stderr,
+    )
+    print(f"  method={discovery.method} source={discovery.source}", file=sys.stderr)
+    if discovery.rejected_reason:
+        print(f"  rejected={discovery.rejected_reason}", file=sys.stderr)
+    if verbose:
+        print(
+            f"  Validate: ls $SPLUNK_HOME/etc/apps/{app}/default/data/ui/views/{view_name}.xml",
             file=sys.stderr,
         )
 
@@ -701,8 +862,10 @@ def keys_defined_locally(app_content: dict, baseline: dict, spec: ConfTypeSpec) 
 
 
 def looks_like_merged_config(candidate: dict, merged_content: dict) -> bool:
-    """Detect when a defaultcontext response is actually merged effective config."""
+    """Detect when a layer response is actually merged effective config."""
     if not candidate or not merged_content:
+        return False
+    if len(candidate) <= 15:
         return False
     if len(candidate) >= max(20, int(len(merged_content) * 0.9)):
         return True
@@ -727,12 +890,18 @@ def is_likely_inherited_default_key(key: str, value, spec: ConfTypeSpec) -> bool
     return normalized in ("", "0", "false")
 
 
+def build_flat_key_export(content: dict, keys: List[str]) -> dict:
+    """Build stdout/file JSON: only listed keys that have values, in discovery order."""
+    return {key: content[key] for key in keys if key in content}
+
+
 def build_flat_local_export(content: dict, local_keys: List[str]) -> dict:
     """Build stdout/file JSON: only local keys that have values, in discovery order."""
-    return {key: content[key] for key in local_keys if key in content}
+    return build_flat_key_export(content, local_keys)
 
 
-def refine_appcontext_local_keys(app_content: dict, spec: ConfTypeSpec) -> List[str]:
+def refine_layer_conf_keys(app_content: dict, spec: ConfTypeSpec) -> List[str]:
+    """Extract meaningful conf keys from a single layer (local or default) response."""
     keys = []
     for key, value in app_content.items():
         if is_conf_metadata_key(key, spec) or is_empty_conf_value(value):
@@ -741,6 +910,14 @@ def refine_appcontext_local_keys(app_content: dict, spec: ConfTypeSpec) -> List[
             continue
         keys.append(key)
     return sorted(keys)
+
+
+def refine_appcontext_local_keys(app_content: dict, spec: ConfTypeSpec) -> List[str]:
+    return refine_layer_conf_keys(app_content, spec)
+
+
+def refine_defaultcontext_keys(default_content: dict, spec: ConfTypeSpec) -> List[str]:
+    return refine_layer_conf_keys(default_content, spec)
 
 
 def conf_collection_endpoint(conf_endpoint: str) -> str:
@@ -867,12 +1044,35 @@ def fetch_app_default_stanza_layer(
     auth,
     headers: dict,
     debug: bool = False,
-) -> Tuple[dict, bool]:
+) -> Tuple[dict, bool, str]:
     """
     Return app default/ settings for a stanza when that stanza exists in default/.
-    Use the collection listing; reject entries that look like merged effective config.
+
+    Prefer defaultonly=true (physical default/ layer). Fall back to defaultcontext
+    collection entries on older Splunk builds that omit defaultonly support.
     """
     collection = conf_collection_endpoint(conf_endpoint)
+    defaultonly_names = list_conf_stanza_names(
+        collection, auth, headers, params={"defaultonly": "true"}
+    )
+    if stanza_name in defaultonly_names:
+        entry = fetch_rest_entry(
+            conf_endpoint,
+            auth,
+            headers,
+            params={"defaultonly": "true"},
+            optional=True,
+        )
+        content = extract_conf_content(entry)
+        if content and not looks_like_merged_config(content, merged_content):
+            if debug:
+                print(
+                    f"Debug: stanza '{stanza_name}' uses app default/ layer via "
+                    f"defaultonly ({len(content)} keys)",
+                    file=sys.stderr,
+                )
+            return content, True, "defaultonly"
+
     default_names = list_conf_stanza_names(
         collection, auth, headers, params={"defaultcontext": "true"}
     )
@@ -882,7 +1082,7 @@ def fetch_app_default_stanza_layer(
                 f"Debug: stanza '{stanza_name}' is not listed in app default/{spec.conf_file}",
                 file=sys.stderr,
             )
-        return {}, False
+        return {}, False, "none"
 
     entry = find_conf_collection_entry(
         collection, stanza_name, auth, headers, params={"defaultcontext": "true"}
@@ -895,14 +1095,14 @@ def fetch_app_default_stanza_layer(
                 f"({len(content)} keys matches merged effective config)",
                 file=sys.stderr,
             )
-        return {}, False
+        return {}, False, "none"
 
     if debug:
         print(
             f"Debug: stanza '{stanza_name}' uses app default/ layer with {len(content)} keys",
             file=sys.stderr,
         )
-    return content, True
+    return content, True, "defaultcontext"
 
 
 def build_inherited_conf_baseline(
@@ -916,7 +1116,7 @@ def build_inherited_conf_baseline(
 ) -> Tuple[dict, bool]:
     """Build lower-precedence conf layers for local diff."""
     inherited_baseline = fetch_global_default_layers(conf_endpoint, spec, auth, headers, debug=debug)
-    app_default_layer, has_app_default_stanza = fetch_app_default_stanza_layer(
+    app_default_layer, has_app_default_stanza, _default_method = fetch_app_default_stanza_layer(
         conf_endpoint, stanza_name, merged_content, spec, auth, headers, debug=debug
     )
 
@@ -949,6 +1149,152 @@ def fetch_appcontext_content(
     return extract_conf_content(
         fetch_rest_entry(conf_endpoint, auth, headers, params={"appcontext": "true"}, optional=True)
     )
+
+
+def fetch_defaultonly_content(
+    conf_endpoint: str,
+    auth,
+    headers: dict,
+) -> dict:
+    """Return defaultonly=true conf content for a stanza (physical app default/ layer)."""
+    return extract_conf_content(
+        fetch_rest_entry(
+            conf_endpoint,
+            auth,
+            headers,
+            params={"defaultonly": "true"},
+            optional=True,
+        )
+    )
+
+
+def fetch_defaultcontext_content(
+    conf_endpoint: str,
+    auth,
+    headers: dict,
+) -> dict:
+    """Return defaultcontext=true conf content for a stanza."""
+    return extract_conf_content(
+        fetch_rest_entry(
+            conf_endpoint,
+            auth,
+            headers,
+            params={"defaultcontext": "true"},
+            optional=True,
+        )
+    )
+
+
+def list_default_conf_stanza_names(
+    conf_endpoint: str,
+    auth,
+    headers: dict,
+) -> List[str]:
+    """List stanza names present in the app's default/ layer for this conf collection."""
+    collection = conf_collection_endpoint(conf_endpoint)
+    names = list_conf_stanza_names(
+        collection, auth, headers, params={"defaultonly": "true"}
+    )
+    if not names:
+        names = list_conf_stanza_names(
+            collection, auth, headers, params={"defaultcontext": "true"}
+        )
+    return sorted(name for name in names if name)
+
+
+def discover_default_conf_keys(
+    conf_endpoint: str,
+    spec: ConfTypeSpec,
+    auth,
+    headers: dict,
+    debug: bool = False,
+) -> Optional[DefaultDiscoveryResult]:
+    """
+    Discover keys defined in default/{conf_file} using REST only.
+
+    Local/appcontext keys are tracked for audit but never exported.
+    """
+    merged_entry = fetch_rest_entry(conf_endpoint, auth, headers, optional=True)
+    if not merged_entry:
+        return None
+
+    stanza_name = conf_stanza_name(conf_endpoint)
+    merged_content = extract_conf_content(merged_entry)
+    merged_key_count = len(merged_content)
+
+    default_collection_stanzas = list_default_conf_stanza_names(conf_endpoint, auth, headers)
+
+    appcontext_content = fetch_appcontext_content(conf_endpoint, auth, headers)
+    appcontext_keys = refine_appcontext_local_keys(appcontext_content, spec)
+
+    app_default_layer, has_app_default_stanza, default_layer_method = fetch_app_default_stanza_layer(
+        conf_endpoint, stanza_name, merged_content, spec, auth, headers, debug=debug
+    )
+    default_keys = (
+        refine_defaultcontext_keys(app_default_layer, spec) if has_app_default_stanza else []
+    )
+
+    rejected_reason: Optional[str] = None
+    method = "none"
+    source = "REST (no default/ keys identified)"
+
+    if default_keys:
+        if default_layer_method == "defaultonly":
+            method = "defaultonly"
+            source = "REST (defaultonly app default/ keys)"
+        else:
+            method = "defaultcontext"
+            source = "REST (defaultcontext app default/ keys)"
+    elif appcontext_keys:
+        rejected_reason = (
+            f"stanza '{stanza_name}' appears local-only "
+            f"(appcontext keys present, no app default/{spec.conf_file} layer via REST)"
+        )
+    else:
+        rejected_reason = (
+            f"stanza '{stanza_name}' not found in app default/{spec.conf_file}"
+        )
+
+    default_key_count = len(default_keys)
+    local_only_keys = sorted(set(appcontext_keys) - set(default_keys))
+
+    if debug:
+        print(
+            f"Debug default discovery [{spec.name}/{stanza_name}]: "
+            f"merged={merged_key_count} default={len(default_keys)} "
+            f"appcontext={len(appcontext_keys)} local_only={len(local_only_keys)} "
+            f"default_collection={len(default_collection_stanzas)} method={method}",
+            file=sys.stderr,
+        )
+
+    return DefaultDiscoveryResult(
+        default_keys=default_keys,
+        source=source if default_keys else "REST (rejected — no exportable default/ keys)",
+        method=method if default_keys else "rejected",
+        merged_key_count=merged_key_count,
+        default_key_count=default_key_count,
+        appcontext_keys=appcontext_keys,
+        local_only_keys=local_only_keys,
+        default_collection_stanzas=default_collection_stanzas,
+        rejected_reason=rejected_reason,
+    )
+
+
+def keys_defined_in_local_layer(
+    appcontext_content: dict,
+    defaultonly_content: dict,
+    spec: ConfTypeSpec,
+) -> List[str]:
+    """
+    Keys Splunk would write to local/: absent from or differing from app default/.
+
+    When the stanza has no app default/ layer, all app-layer keys are treated as local.
+    """
+    app_keys = refine_appcontext_local_keys(appcontext_content, spec)
+    default_keys = refine_defaultcontext_keys(defaultonly_content, spec)
+    if not default_keys:
+        return app_keys
+    return keys_defined_locally(appcontext_content, defaultonly_content, spec)
 
 
 def discover_local_conf_keys(
@@ -997,6 +1343,39 @@ def discover_local_conf_keys(
         if debug:
             print(f"Debug: {appcontext_rejected}", file=sys.stderr)
         appcontext_keys = []
+
+    defaultonly_content = fetch_defaultonly_content(conf_endpoint, auth, headers)
+    defaultonly_keys = refine_defaultcontext_keys(defaultonly_content, spec)
+
+    if defaultonly_keys:
+        local_keys = keys_defined_in_local_layer(appcontext_content, defaultonly_content, spec)
+        if local_keys:
+            method = "defaultonly-diff"
+            source = "REST (appcontext keys absent from or differing vs app default/)"
+        else:
+            rejected_reason = (
+                f"stanza '{stanza_name}' exists only in app default/{spec.conf_file}, not local/"
+            )
+            local_keys = []
+            method = "rejected"
+            source = "REST (rejected — default/ only; use --default_only)"
+        if debug:
+            print(
+                f"Debug local discovery [{spec.name}/{stanza_name}]: "
+                f"defaultonly={len(defaultonly_keys)} layer_local={len(local_keys)} "
+                f"method={method}",
+                file=sys.stderr,
+            )
+        return LocalDiscoveryResult(
+            local_keys=local_keys,
+            source=source,
+            method=method,
+            merged_key_count=merged_key_count,
+            baseline_key_count=len(defaultonly_keys),
+            baseline_diff_keys=local_keys,
+            appcontext_keys=appcontext_keys or refine_appcontext_local_keys(appcontext_content, spec),
+            rejected_reason=rejected_reason if not local_keys else None,
+        )
 
     baseline, has_app_default_stanza = build_inherited_conf_baseline(
         conf_endpoint, stanza_name, merged_content, spec, auth, headers, debug=debug
@@ -1090,7 +1469,52 @@ def discover_local_conf_keys(
         baseline_diff_keys=baseline_diff_keys,
         appcontext_keys=appcontext_keys,
         rejected_reason=rejected_reason,
+        )
+
+
+def log_default_discovery_report(
+    spec: ConfTypeSpec,
+    *,
+    app: str,
+    stanza: str,
+    discovery: DefaultDiscoveryResult,
+    verbose: bool = False,
+) -> None:
+    """Print a concise stderr summary of default-layer discovery."""
+    print(
+        f"Default export [{spec.conf_file}] app='{app}' stanza='{stanza}'",
+        file=sys.stderr,
     )
+    print(
+        f"  merged_keys={discovery.merged_key_count} "
+        f"default_layer_keys={discovery.default_key_count} "
+        f"appcontext_suppressed={len(discovery.appcontext_keys)} "
+        f"local_only_suppressed={len(discovery.local_only_keys)}",
+        file=sys.stderr,
+    )
+    print(
+        f"  method={discovery.method} default_keys={len(discovery.default_keys)} "
+        f"default_collection_stanzas={len(discovery.default_collection_stanzas)}",
+        file=sys.stderr,
+    )
+    if discovery.default_keys:
+        print(f"  keys={discovery.default_keys}", file=sys.stderr)
+    if discovery.local_only_keys:
+        print(f"  suppressed_local_only_keys={discovery.local_only_keys}", file=sys.stderr)
+    if discovery.rejected_reason:
+        print(f"  rejected={discovery.rejected_reason}", file=sys.stderr)
+    print(f"  source={discovery.source}", file=sys.stderr)
+    if verbose:
+        if discovery.default_collection_stanzas:
+            print(
+                f"  default_collection_stanzas={discovery.default_collection_stanzas}",
+                file=sys.stderr,
+            )
+        print(
+            f"  validate: splunk btool {spec.name} list --debug \"{stanza}\" "
+            f"| grep \"etc/apps/{app}/default\" | grep -v \" = $\"",
+            file=sys.stderr,
+        )
 
 
 def log_local_discovery_report(
@@ -1156,6 +1580,51 @@ def export_local_conf_values(
     return content, missing_keys, entry
 
 
+def export_default_conf_values(
+    conf_endpoint: str,
+    default_keys: List[str],
+    auth,
+    headers: dict,
+) -> Tuple[dict, List[str], dict]:
+    """Export values for default/ keys from defaultonly or defaultcontext layer."""
+    stanza_name = conf_stanza_name(conf_endpoint)
+    collection = conf_collection_endpoint(conf_endpoint)
+    entry: Optional[dict] = None
+    for layer_param in ("defaultonly", "defaultcontext", "appcontext"):
+        entry = fetch_rest_entry(
+            conf_endpoint,
+            auth,
+            headers,
+            params={layer_param: "true"},
+            optional=True,
+        )
+        if not entry:
+            entry = find_conf_collection_entry(
+                collection, stanza_name, auth, headers, params={layer_param: "true"}
+            )
+        if not entry:
+            continue
+        raw_content, _missing = export_requested_keys(entry, default_keys)
+        content = {
+            key: value
+            for key, value in raw_content.items()
+            if key in default_keys and value is not None
+        }
+        if len(content) == len(default_keys):
+            missing_keys = [key for key in default_keys if key not in content]
+            return content, missing_keys, entry
+    if not entry:
+        entry = fetch_rest_entry(conf_endpoint, auth, headers)
+    raw_content, _missing = export_requested_keys(entry, default_keys)
+    content = {
+        key: value
+        for key, value in raw_content.items()
+        if key in default_keys and value is not None
+    }
+    missing_keys = [key for key in default_keys if key not in content]
+    return content, missing_keys, entry
+
+
 def build_migration_envelope(
     spec: ConfTypeSpec,
     *,
@@ -1188,6 +1657,43 @@ def build_migration_envelope(
     }
 
 
+def build_default_migration_envelope(
+    spec: ConfTypeSpec,
+    *,
+    endpoint: str,
+    owner: str,
+    app: str,
+    stanza: str,
+    default_keys: List[str],
+    default_collection_stanzas: List[str],
+    content: dict,
+    discovery_source: str,
+    discovery_method: str = "",
+    local_only_keys: Optional[List[str]] = None,
+) -> dict:
+    parsed = urlparse(endpoint)
+    return {
+        "migration_version": MIGRATION_ENVELOPE_VERSION,
+        "tool_version": __version__,
+        "conf_type": spec.name,
+        "conf_file": spec.conf_file,
+        "layer": "default",
+        "source": {
+            "host": parsed.netloc,
+            "endpoint": endpoint,
+            "owner": owner,
+            "app": app,
+        },
+        "stanza": stanza,
+        "default_keys": default_keys,
+        "default_collection_stanzas": default_collection_stanzas,
+        "suppressed_local_only_keys": local_only_keys or [],
+        "discovery_source": discovery_source,
+        "discovery_method": discovery_method,
+        "content": content,
+    }
+
+
 def build_view_migration_envelope(
     *,
     endpoint: str,
@@ -1212,6 +1718,39 @@ def build_view_migration_envelope(
             "app": app,
         },
         "view_name": view_name,
+        "discovery_source": discovery_source,
+        "discovery_method": discovery_method,
+        "content": content,
+    }
+
+
+def build_default_view_migration_envelope(
+    *,
+    endpoint: str,
+    owner: str,
+    app: str,
+    view_name: str,
+    data_ui_views_url: str,
+    content: dict,
+    discovery_source: str,
+    discovery_method: str,
+    local_override: bool = False,
+) -> dict:
+    parsed = urlparse(endpoint)
+    return {
+        "migration_version": MIGRATION_ENVELOPE_VERSION,
+        "tool_version": __version__,
+        "conf_type": "views",
+        "layer": "default",
+        "source": {
+            "host": parsed.netloc,
+            "endpoint": endpoint,
+            "data_ui_views_url": data_ui_views_url,
+            "owner": owner,
+            "app": app,
+        },
+        "view_name": view_name,
+        "local_override_suppressed": local_override,
         "discovery_source": discovery_source,
         "discovery_method": discovery_method,
         "content": content,
@@ -1502,8 +2041,215 @@ def endpoint_hint_for_mode(mode: str) -> str:
     return f"/servicesNS/{{owner}}/{{app}}/configs/{spec.conf_rest}/{{stanza}}"
 
 
+def run_export_default_local(spec: ConfTypeSpec, args, auth, headers) -> None:
+    """Export app default/ conf keys for one stanza (default/ layer only)."""
+    ctx = resolve_local_export_context(args.endpoint, spec)
+    if not ctx:
+        if spec.ko_collection:
+            print(
+                f"Error: {args.mode} requires a {spec.ko_collection} endpoint "
+                f"(/servicesNS/{{owner}}/{{app}}/{spec.ko_collection}/{{name}}).",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"Error: {args.mode} requires a configs/{spec.conf_rest}/{{stanza}} endpoint.",
+                file=sys.stderr,
+            )
+        sys.exit(1)
+
+    owner, app, stanza_name, conf_endpoint = ctx
+
+    discovery = discover_default_conf_keys(
+        conf_endpoint, spec, auth, headers, debug=args.debug_local_keys
+    )
+
+    if discovery is None:
+        print(
+            "Error: REST default-layer discovery failed for "
+            f"stanza '{stanza_name}' in app '{app}'.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    log_default_discovery_report(
+        spec,
+        app=app,
+        stanza=stanza_name,
+        discovery=discovery,
+        verbose=args.debug_local_keys,
+    )
+
+    if not discovery.default_keys:
+        if discovery.rejected_reason:
+            print(
+                f"Error: default-layer discovery rejected for stanza '{stanza_name}' "
+                f"in app '{app}': {discovery.rejected_reason}",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"Error: no default/ {spec.conf_file} keys found for "
+                f"stanza '{stanza_name}' in app '{app}'.",
+                file=sys.stderr,
+            )
+        sys.exit(1)
+
+    content, missing_keys, conf_entry = export_default_conf_values(
+        conf_endpoint, discovery.default_keys, auth, headers
+    )
+    warn_missing_keys(conf_entry, missing_keys)
+
+    flat_output = build_flat_key_export(content, discovery.default_keys)
+
+    if args.migration_envelope:
+        if not args.output:
+            print(
+                "Warning: --migration-envelope requires --output; "
+                "writing flat default keys to stdout only.",
+                file=sys.stderr,
+            )
+            write_json_output(flat_output, None)
+        else:
+            envelope = build_default_migration_envelope(
+                spec,
+                endpoint=args.endpoint,
+                owner=owner,
+                app=app,
+                stanza=stanza_name,
+                default_keys=discovery.default_keys,
+                default_collection_stanzas=discovery.default_collection_stanzas,
+                content=flat_output,
+                discovery_source=discovery.source,
+                discovery_method=discovery.method,
+                local_only_keys=discovery.local_only_keys,
+            )
+            write_json_output(flat_output, None)
+            write_json_output(
+                envelope,
+                args.output,
+                f"Successfully wrote default migration envelope to '{{}}'",
+            )
+    else:
+        write_json_output(
+            flat_output,
+            args.output,
+            f"Successfully exported {len(flat_output)} default/ {spec.conf_file} keys to '{{}}'",
+        )
+
+
+def run_export_default_view(args, auth, headers) -> None:
+    """Export default-only dashboard XML (eai:data) from data/ui/views."""
+    ctx = resolve_view_export_context(args.endpoint)
+    if not ctx:
+        print(
+            f"Error: {VIEW_EXPORT_MODE} requires a saved/views, data/ui/views, "
+            "or configs/conf-views endpoint.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    owner, app, view_name, data_ui_views_url = ctx
+
+    discovery = discover_default_view(
+        data_ui_views_url,
+        owner,
+        app,
+        view_name,
+        auth,
+        headers,
+        debug=args.debug_local_keys,
+    )
+
+    if discovery is None:
+        print(
+            f"Error: view '{view_name}' not found in app '{app}' "
+            f"at {data_ui_views_url}.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    log_default_view_discovery_report(
+        app=app,
+        view_name=view_name,
+        owner=owner,
+        discovery=discovery,
+        verbose=args.debug_local_keys,
+    )
+
+    if not discovery.is_default:
+        print(
+            f"Error: view '{view_name}' in app '{app}' is not a default dashboard: "
+            f"{discovery.rejected_reason or discovery.source}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if not discovery.entry:
+        print(
+            f"Error: default view discovery returned no REST entry for '{view_name}'.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    payload = build_view_export_payload(discovery.entry)
+
+    if not payload.get("eai:data"):
+        print(
+            f"Error: default view '{view_name}' in app '{app}' has no eai:data (dashboard XML).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if discovery.local_override:
+        print(
+            f"  note=local override suppressed; exporting default/ XML only",
+            file=sys.stderr,
+        )
+
+    xml_bytes = len(str(payload["eai:data"]).encode("utf-8"))
+    print(f"  xml_bytes={xml_bytes}", file=sys.stderr)
+
+    if args.migration_envelope:
+        if not args.output:
+            print(
+                "Warning: --migration-envelope requires --output; "
+                "writing flat default view JSON to stdout only.",
+                file=sys.stderr,
+            )
+            write_json_output(payload, None)
+        else:
+            envelope = build_default_view_migration_envelope(
+                endpoint=args.endpoint,
+                owner=owner,
+                app=app,
+                view_name=view_name,
+                data_ui_views_url=data_ui_views_url,
+                content=payload,
+                discovery_source=discovery.source,
+                discovery_method=discovery.method,
+                local_override=discovery.local_override,
+            )
+            write_json_output(payload, None)
+            write_json_output(
+                envelope,
+                args.output,
+                f"Successfully wrote default migration envelope to '{{}}'",
+            )
+    else:
+        write_json_output(
+            payload,
+            args.output,
+            f"Successfully exported default dashboard XML for view '{view_name}' to '{{}}'",
+        )
+
+
 def run_export_local(spec: ConfTypeSpec, args, auth, headers) -> None:
     """Export locally-defined conf keys for one stanza/KO (local/ layer only)."""
+    if args.default_only:
+        run_export_default_local(spec, args, auth, headers)
+        return
+
     ctx = resolve_local_export_context(args.endpoint, spec)
     if not ctx:
         if spec.ko_collection:
@@ -1600,6 +2346,10 @@ def run_export_local(spec: ConfTypeSpec, args, auth, headers) -> None:
 
 def run_export_view(args, auth, headers) -> None:
     """Export local-only dashboard XML (eai:data) from data/ui/views for migration."""
+    if args.default_only:
+        run_export_default_view(args, auth, headers)
+        return
+
     ctx = resolve_view_export_context(args.endpoint)
     if not ctx:
         print(
@@ -1725,14 +2475,22 @@ def main():
     parser.add_argument(
         "--debug-local-keys",
         action="store_true",
-        help="Verbose stderr logging for local-key discovery (export-* local modes).",
+        help="Verbose stderr logging for local/default key discovery (export-* modes).",
+    )
+    parser.add_argument(
+        "--default_only",
+        action="store_true",
+        help=(
+            "Export app default/ layer only (export-* modes). "
+            "Uses defaultonly/defaultcontext REST discovery; suppresses local/ keys and local view overrides."
+        ),
     )
     parser.add_argument(
         "--migration-envelope",
         action="store_true",
         help=(
             "Also write migration metadata envelope to --output (export-* modes). "
-            "Stdout always receives flat local key JSON only."
+            "Stdout always receives flat key/view JSON only."
         ),
     )
     parser.add_argument("--input", help="Required for update/post modes. Source payload file path.")
@@ -1743,6 +2501,15 @@ def main():
     parser.add_argument("--name", help="Required for post mode. New resource name identifier.")
     parser.add_argument("--dry-run", action="store_true", help="Print equivalent curl statement.")
     args = parser.parse_args()
+
+    layer_export_modes = set(EXPORT_MODE_TO_CONF_TYPE.keys()) | {VIEW_EXPORT_MODE}
+    if args.default_only and args.mode not in layer_export_modes:
+        print(
+            "Error: --default_only applies only to export-* modes "
+            f"({', '.join(sorted(layer_export_modes))}).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     auth, headers = get_auth_config(args.credentials)
     payload = {}
@@ -1777,14 +2544,16 @@ def main():
         elif args.mode in local_export_modes:
             dest = args.output if args.output else "STDOUT"
             conf_type = EXPORT_MODE_TO_CONF_TYPE[args.mode]
+            layer = "default/" if args.default_only else "local/"
             print(
-                f"\nNOTE: Live run discovers local {CONF_TYPE_REGISTRY[conf_type].conf_file} keys via REST "
+                f"\nNOTE: Live run discovers {layer} {CONF_TYPE_REGISTRY[conf_type].conf_file} keys via REST "
                 f"and writes JSON to: {dest}\n"
             )
         elif args.mode == VIEW_EXPORT_MODE:
             dest = args.output if args.output else "STDOUT"
+            layer = "default/data/ui/views" if args.default_only else "local/data/ui/views"
             print(
-                f"\nNOTE: Live run discovers local/data/ui/views XML via REST "
+                f"\nNOTE: Live run discovers {layer} XML via REST "
                 f"and writes JSON to: {dest}\n"
             )
         elif args.mode == "endpointreview":

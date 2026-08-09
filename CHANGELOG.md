@@ -123,7 +123,7 @@ First official release of the Splunk Knowledge Object Manager CLI.
 - Export output uses legible JSON (`indent=2`, sorted keys, UTF-8).
 - `endpointreview` filters out `null` values recursively before printing.
 
-[1.6.0]: #
+[1.6.0]: https://github.com/krieser/splunk_ko_manager/releases/tag/v1.6.0
 [1.5.0]: #
 [1.4.3]: #
 [1.4.2]: #

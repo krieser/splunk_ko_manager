@@ -51,7 +51,7 @@ python splunk_ko_manager.py \
   --endpoint 'https://127.0.0.1:8089/servicesNS/nobody/myapp/saved/views/my_view' \
   --credentials user 'admin:password'
 
-# Manual key export (any endpoint)
+# Manual key export — only keys defined in local/ are returned for conf/KO endpoints
 python splunk_ko_manager.py \
   --mode export \
   --endpoint 'https://127.0.0.1:8089/servicesNS/nobody/recon/saved/searches/my_search' \
@@ -63,7 +63,7 @@ python splunk_ko_manager.py \
 
 | Mode | Endpoint format | Description |
 |------|-----------------|-------------|
-| `export` | Any REST URL | Export explicit `--keys` list |
+| `export` | Any REST URL | Export explicit `--keys`; for conf/KO URLs, **local/** keys only (inherited/merged keys omitted) |
 | `export-savedsearches` | `/saved/searches/{name}` | Local `savedsearches.conf` keys |
 | `export-props` | `/configs/conf-props/{stanza}` | Local `props.conf` keys |
 | `export-transforms` | `/configs/conf-transforms/{stanza}` | Local `transforms.conf` keys |
@@ -79,10 +79,10 @@ All `export-*` modes export **only keys from `local/{conf_file}`** — never the
 
 Discovery (stderr always logs a summary; `--debug-local-keys` adds btool validation hints):
 
-1. Fetch merged stanza and `appcontext=true` from the conf REST endpoint.
-2. Build inherited baseline (system `[default]` + app `default/` when available).
-3. Compute baseline diff; cross-check with appcontext and prefer intersection when both are trustworthy.
-4. **Reject** sets that look like merged config (≥15% of merged keys or ≥20 keys).
+1. List app `default/` stanzas (collection `defaultonly=true`) and fetch `appcontext=true`.
+2. **Local-only stanza** (not in app `default/`): export refined appcontext keys — **2 REST GETs**, no merged fetch when fewer than 20 keys.
+3. **Default/ stanza**: diff `appcontext` vs `defaultonly` — **3 REST GETs**, no merged fetch.
+4. **Fallback** (large appcontext set or default layer fetch failed): fetch merged effective config and inherited baseline; cross-check and reject merged-looking sets (≥15% of merged keys or ≥20 keys).
 5. Export values from the **conf stanza endpoint only**.
 
 Example stderr:
@@ -107,6 +107,24 @@ Use **`--default_only`** with any **`export-*`** mode to export the app **`defau
 | Views | `local/data/ui/views/` XML | `default/data/ui/views/` XML; local overrides suppressed |
 | Inventory | Per stanza | Also logs `default_collection_stanzas` — all stanzas in app default/ for that conf type |
 
+Discovery minimizes REST calls:
+
+1. List app `default/` stanzas (collection `defaultonly=true`).
+2. If stanza **not listed** → reject (local-only); optional `appcontext` + merged only to refine the error.
+3. If stanza **listed** → fetch `defaultonly=true` for that stanza (reuses the same response for export values).
+4. Optional `appcontext=true` for `local_only_suppressed` stderr audit keys.
+5. **Views:** probe `defaultcontext` first, then `appcontext`, then effective only as fallback.
+
+Example stderr (conf):
+
+```text
+Default export [props.conf] app='myapp' stanza='firewall'
+  merged_keys=0 default_layer_keys=12 appcontext_suppressed=3 local_only_suppressed=3
+  method=defaultonly default_keys=12 default_collection_stanzas=847
+  keys=['TRANSFORMS', 'SHOULD_LINEMERGE', ...]
+  suppressed_local_only_keys=['description']
+```
+
 ```bash
 # Shipped props stanza from app default/
 python splunk_ko_manager.py --mode export-props --default_only \
@@ -118,16 +136,6 @@ python splunk_ko_manager.py --mode export-views --default_only \
   --endpoint 'https://127.0.0.1:8089/servicesNS/nobody/SplunkEnterpriseSecuritySuite/data/ui/views/aaa' \
   --credentials user 'admin:password' \
   --output aaa_default.json
-```
-
-Example stderr (conf):
-
-```text
-Default export [props.conf] app='myapp' stanza='firewall'
-  merged_keys=42 default_layer_keys=12 appcontext_suppressed=3 local_only_suppressed=3
-  method=defaultonly default_keys=12 default_collection_stanzas=847
-  keys=['TRANSFORMS', 'SHOULD_LINEMERGE', ...]
-  suppressed_local_only_keys=['description']
 ```
 
 ### Props and transforms endpoint notes

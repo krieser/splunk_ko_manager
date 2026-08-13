@@ -1,6 +1,6 @@
 [project]
 name = "splunk-ko-manager"
-version = "1.6.0"
+version = "1.6.1"
 description = "CLI tool for exporting, reviewing, and updating Splunk saved searches via the REST API."
 readme = "README.md"
 requires-python = ">=3.9"

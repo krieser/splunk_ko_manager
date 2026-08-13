@@ -2,3 +2,10 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+
+# Local Splunk test scratch files (never commit credentials or export snapshots)
+test
+test_*.json
+*_default.json
+*_local.json
+aaa.json

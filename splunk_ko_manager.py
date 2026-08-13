@@ -16,7 +16,7 @@ import urllib3
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-__version__ = "1.6.0"
+__version__ = "1.6.1"
 MIGRATION_ENVELOPE_VERSION = "1"
 
 _DATA_UI_VIEWS_RE = re.compile(
@@ -91,6 +91,7 @@ class DefaultDiscoveryResult:
     local_only_keys: List[str]
     default_collection_stanzas: List[str]
     rejected_reason: Optional[str] = None
+    default_layer_entry: Optional[dict] = None
 
 
 @dataclass
@@ -505,41 +506,30 @@ def discover_default_view(
     """
     Determine whether a dashboard exists in default/data/ui/views and export that layer.
 
-    Local/appcontext overrides are detected and suppressed from export.
+    Minimizes REST calls: probes defaultcontext first, then appcontext, then effective.
     """
-    effective_entry, _ = fetch_view_layer_entry(
-        data_ui_views_url, auth, headers, None, debug=debug
-    )
-    effective_data = extract_view_eai_data(effective_entry)
-
-    appcontext_entry, _ = fetch_view_layer_entry(
-        data_ui_views_url, auth, headers, "appcontext", debug=debug
-    )
-    appcontext_data = extract_view_eai_data(appcontext_entry)
-
     defaultcontext_entry, defaultcontext_status = fetch_view_layer_entry(
         data_ui_views_url, auth, headers, "defaultcontext", debug=debug
     )
     defaultcontext_data = extract_view_eai_data(defaultcontext_entry)
-
-    appcontext_present = bool(appcontext_data)
     defaultcontext_present = bool(defaultcontext_data)
-    effective_present = bool(effective_data)
-    local_override = bool(
-        appcontext_present
-        and defaultcontext_present
-        and normalize_view_xml(appcontext_data) != normalize_view_xml(defaultcontext_data)
-    )
-
-    if debug:
-        print(
-            f"Debug default view discovery [{view_name}]: effective={effective_present} "
-            f"defaultcontext={defaultcontext_present} appcontext={appcontext_present} "
-            f"local_override={local_override}",
-            file=sys.stderr,
-        )
 
     if defaultcontext_present:
+        appcontext_entry, _ = fetch_view_layer_entry(
+            data_ui_views_url, auth, headers, "appcontext", debug=debug
+        )
+        appcontext_data = extract_view_eai_data(appcontext_entry)
+        appcontext_present = bool(appcontext_data)
+        local_override = bool(
+            appcontext_present
+            and normalize_view_xml(appcontext_data) != normalize_view_xml(defaultcontext_data)
+        )
+        if debug:
+            print(
+                f"Debug default view discovery [{view_name}]: defaultcontext=true "
+                f"appcontext={appcontext_present} local_override={local_override}",
+                file=sys.stderr,
+            )
         return DefaultViewDiscoveryResult(
             is_default=True,
             source="REST (defaultcontext default/data/ui/views)",
@@ -547,25 +537,50 @@ def discover_default_view(
             entry=defaultcontext_entry,
             defaultcontext_present=True,
             appcontext_present=appcontext_present,
-            effective_present=effective_present,
+            effective_present=False,
             local_override=local_override,
         )
 
-    if appcontext_present and not defaultcontext_present:
+    appcontext_entry, _ = fetch_view_layer_entry(
+        data_ui_views_url, auth, headers, "appcontext", debug=debug
+    )
+    appcontext_data = extract_view_eai_data(appcontext_entry)
+    appcontext_present = bool(appcontext_data)
+
+    if appcontext_present:
+        if debug:
+            print(
+                f"Debug default view discovery [{view_name}]: defaultcontext=false "
+                f"appcontext=true (local-only)",
+                file=sys.stderr,
+            )
         return DefaultViewDiscoveryResult(
             is_default=False,
             source="REST (local-only view — no default/ layer)",
             method="rejected",
-            entry=effective_entry,
+            entry=appcontext_entry,
             rejected_reason=(
                 f"view '{view_name}' in app '{app}' has local/data/ui/views/ content "
                 "but no default/ layer via REST"
             ),
             appcontext_present=True,
-            effective_present=effective_present,
+            effective_present=False,
         )
 
-    if effective_present and not appcontext_present:
+    effective_entry, _ = fetch_view_layer_entry(
+        data_ui_views_url, auth, headers, None, debug=debug
+    )
+    effective_data = extract_view_eai_data(effective_entry)
+    effective_present = bool(effective_data)
+
+    if debug:
+        print(
+            f"Debug default view discovery [{view_name}]: defaultcontext=false "
+            f"appcontext=false effective={effective_present}",
+            file=sys.stderr,
+        )
+
+    if effective_present:
         return DefaultViewDiscoveryResult(
             is_default=True,
             source="REST (effective view; no local override detected)",
@@ -1202,6 +1217,87 @@ def list_default_conf_stanza_names(
     return sorted(name for name in names if name)
 
 
+def _discover_default_conf_keys_defaultcontext_fallback(
+    conf_endpoint: str,
+    stanza_name: str,
+    spec: ConfTypeSpec,
+    auth,
+    headers: dict,
+    default_collection_stanzas: List[str],
+    debug: bool = False,
+) -> Optional[DefaultDiscoveryResult]:
+    """Fallback when stanza is listed in default/ but defaultonly stanza GET is empty."""
+    collection = conf_collection_endpoint(conf_endpoint)
+    entry = find_conf_collection_entry(
+        collection, stanza_name, auth, headers, params={"defaultcontext": "true"}
+    )
+    if not entry:
+        entry = fetch_rest_entry(
+            conf_endpoint,
+            auth,
+            headers,
+            params={"defaultcontext": "true"},
+            optional=True,
+        )
+    content = extract_conf_content(entry)
+    merged_key_count = 0
+    if content and len(content) > 15:
+        merged_entry = fetch_rest_entry(conf_endpoint, auth, headers, optional=True)
+        merged_content = extract_conf_content(merged_entry) if merged_entry else {}
+        merged_key_count = len(merged_content)
+        if looks_like_merged_config(content, merged_content):
+            content = {}
+            entry = None
+
+    default_keys = refine_defaultcontext_keys(content, spec)
+    appcontext_keys = refine_appcontext_local_keys(
+        fetch_appcontext_content(conf_endpoint, auth, headers), spec
+    )
+    local_only_keys = sorted(set(appcontext_keys) - set(default_keys))
+
+    if not default_keys:
+        rejected_reason = (
+            f"stanza '{stanza_name}' listed in app default/{spec.conf_file} collection "
+            "but no exportable default/ keys via REST"
+        )
+        if debug:
+            print(
+                f"Debug default discovery [{spec.name}/{stanza_name}]: "
+                f"defaultcontext fallback empty; rejected",
+                file=sys.stderr,
+            )
+        return DefaultDiscoveryResult(
+            default_keys=[],
+            source="REST (rejected — no exportable default/ keys)",
+            method="rejected",
+            merged_key_count=merged_key_count,
+            default_key_count=0,
+            appcontext_keys=appcontext_keys,
+            local_only_keys=local_only_keys,
+            default_collection_stanzas=default_collection_stanzas,
+            rejected_reason=rejected_reason,
+        )
+
+    if debug:
+        print(
+            f"Debug default discovery [{spec.name}/{stanza_name}]: "
+            f"defaultcontext fallback default={len(default_keys)} "
+            f"appcontext={len(appcontext_keys)}",
+            file=sys.stderr,
+        )
+    return DefaultDiscoveryResult(
+        default_keys=default_keys,
+        source="REST (defaultcontext app default/ keys)",
+        method="defaultcontext",
+        merged_key_count=merged_key_count,
+        default_key_count=len(default_keys),
+        appcontext_keys=appcontext_keys,
+        local_only_keys=local_only_keys,
+        default_collection_stanzas=default_collection_stanzas,
+        default_layer_entry=entry,
+    )
+
+
 def discover_default_conf_keys(
     conf_endpoint: str,
     spec: ConfTypeSpec,
@@ -1212,71 +1308,95 @@ def discover_default_conf_keys(
     """
     Discover keys defined in default/{conf_file} using REST only.
 
-    Local/appcontext keys are tracked for audit but never exported.
+    Minimizes REST calls:
+    1. List default/ stanzas (collection defaultonly=true, one GET)
+    2. defaultonly=true per stanza when listed (one GET)
+    3. appcontext=true only for local-only audit keys (optional third GET)
+
+    Merged effective config is not fetched on the defaultonly happy path.
     """
-    merged_entry = fetch_rest_entry(conf_endpoint, auth, headers, optional=True)
-    if not merged_entry:
-        return None
-
     stanza_name = conf_stanza_name(conf_endpoint)
-    merged_content = extract_conf_content(merged_entry)
-    merged_key_count = len(merged_content)
-
     default_collection_stanzas = list_default_conf_stanza_names(conf_endpoint, auth, headers)
+    stanza_in_default = stanza_name in set(default_collection_stanzas)
 
-    appcontext_content = fetch_appcontext_content(conf_endpoint, auth, headers)
-    appcontext_keys = refine_appcontext_local_keys(appcontext_content, spec)
-
-    app_default_layer, has_app_default_stanza, default_layer_method = fetch_app_default_stanza_layer(
-        conf_endpoint, stanza_name, merged_content, spec, auth, headers, debug=debug
-    )
-    default_keys = (
-        refine_defaultcontext_keys(app_default_layer, spec) if has_app_default_stanza else []
-    )
-
-    rejected_reason: Optional[str] = None
-    method = "none"
-    source = "REST (no default/ keys identified)"
-
-    if default_keys:
-        if default_layer_method == "defaultonly":
-            method = "defaultonly"
-            source = "REST (defaultonly app default/ keys)"
-        else:
-            method = "defaultcontext"
-            source = "REST (defaultcontext app default/ keys)"
-    elif appcontext_keys:
+    if not stanza_in_default:
+        appcontext_keys = refine_appcontext_local_keys(
+            fetch_appcontext_content(conf_endpoint, auth, headers), spec
+        )
+        if not appcontext_keys:
+            merged_entry = fetch_rest_entry(conf_endpoint, auth, headers, optional=True)
+            if not merged_entry:
+                return None
+            if not extract_conf_content(merged_entry):
+                return None
         rejected_reason = (
             f"stanza '{stanza_name}' appears local-only "
             f"(appcontext keys present, no app default/{spec.conf_file} layer via REST)"
+            if appcontext_keys
+            else f"stanza '{stanza_name}' not found in app default/{spec.conf_file}"
         )
-    else:
-        rejected_reason = (
-            f"stanza '{stanza_name}' not found in app default/{spec.conf_file}"
+        if debug:
+            print(
+                f"Debug default discovery [{spec.name}/{stanza_name}]: "
+                f"not in default/ collection; appcontext={len(appcontext_keys)}",
+                file=sys.stderr,
+            )
+        return DefaultDiscoveryResult(
+            default_keys=[],
+            source="REST (rejected — no exportable default/ keys)",
+            method="rejected",
+            merged_key_count=0,
+            default_key_count=0,
+            appcontext_keys=appcontext_keys,
+            local_only_keys=appcontext_keys,
+            default_collection_stanzas=default_collection_stanzas,
+            rejected_reason=rejected_reason,
         )
 
-    default_key_count = len(default_keys)
+    default_layer_entry = fetch_rest_entry(
+        conf_endpoint,
+        auth,
+        headers,
+        params={"defaultonly": "true"},
+        optional=True,
+    )
+    defaultonly_content = extract_conf_content(default_layer_entry)
+    default_keys = refine_defaultcontext_keys(defaultonly_content, spec)
+
+    if not default_keys:
+        return _discover_default_conf_keys_defaultcontext_fallback(
+            conf_endpoint,
+            stanza_name,
+            spec,
+            auth,
+            headers,
+            default_collection_stanzas,
+            debug=debug,
+        )
+
+    appcontext_keys = refine_appcontext_local_keys(
+        fetch_appcontext_content(conf_endpoint, auth, headers), spec
+    )
     local_only_keys = sorted(set(appcontext_keys) - set(default_keys))
 
     if debug:
         print(
             f"Debug default discovery [{spec.name}/{stanza_name}]: "
-            f"merged={merged_key_count} default={len(default_keys)} "
-            f"appcontext={len(appcontext_keys)} local_only={len(local_only_keys)} "
-            f"default_collection={len(default_collection_stanzas)} method={method}",
+            f"defaultonly={len(default_keys)} appcontext={len(appcontext_keys)} "
+            f"local_only={len(local_only_keys)} (skipped merged fetch)",
             file=sys.stderr,
         )
 
     return DefaultDiscoveryResult(
         default_keys=default_keys,
-        source=source if default_keys else "REST (rejected — no exportable default/ keys)",
-        method=method if default_keys else "rejected",
-        merged_key_count=merged_key_count,
-        default_key_count=default_key_count,
+        source="REST (defaultonly app default/ keys)",
+        method="defaultonly",
+        merged_key_count=0,
+        default_key_count=len(default_keys),
         appcontext_keys=appcontext_keys,
         local_only_keys=local_only_keys,
         default_collection_stanzas=default_collection_stanzas,
-        rejected_reason=rejected_reason,
+        default_layer_entry=default_layer_entry,
     )
 
 
@@ -1297,85 +1417,92 @@ def keys_defined_in_local_layer(
     return keys_defined_locally(appcontext_content, defaultonly_content, spec)
 
 
-def discover_local_conf_keys(
+def stanza_in_app_default_layer(
     conf_endpoint: str,
+    stanza_name: str,
+    auth,
+    headers: dict,
+) -> bool:
+    """True when stanza_name is listed in the app's default/ conf layer via REST."""
+    return stanza_name in set(list_default_conf_stanza_names(conf_endpoint, auth, headers))
+
+
+def _discover_local_from_default_layer(
+    conf_endpoint: str,
+    stanza_name: str,
     spec: ConfTypeSpec,
     auth,
     headers: dict,
+    appcontext_content: dict,
+    appcontext_keys: List[str],
     debug: bool = False,
 ) -> Optional[LocalDiscoveryResult]:
     """
-    Discover keys defined in local/{conf_file} using REST only.
+    Stanza exists in app default/: diff appcontext vs defaultonly (2 layer GETs
+    after collection probe — no merged fetch).
 
-    Never returns the full merged stanza key set. Uses baseline diff when
-    trustworthy, always cross-checks appcontext when available, and rejects
-    candidate sets that look like merged effective configuration.
+    Returns None when the stanza is listed in default/ but the stanza-level
+    defaultonly fetch is empty (caller should fall back to baseline discovery).
     """
-    merged_entry = fetch_rest_entry(conf_endpoint, auth, headers, optional=True)
-    if not merged_entry:
-        return None
-
-    stanza_name = conf_stanza_name(conf_endpoint)
-    merged_content = extract_conf_content(merged_entry)
-    merged_key_count = len(merged_content)
-    if not merged_content:
-        return LocalDiscoveryResult(
-            local_keys=[],
-            source="REST (empty merged stanza)",
-            method="none",
-            merged_key_count=0,
-            baseline_key_count=0,
-            baseline_diff_keys=[],
-            appcontext_keys=[],
-            rejected_reason="merged stanza returned no content keys",
-        )
-
-    threshold = local_key_count_threshold(merged_key_count)
-
-    appcontext_content = fetch_appcontext_content(conf_endpoint, auth, headers)
-    appcontext_keys = refine_appcontext_local_keys(appcontext_content, spec)
-    appcontext_rejected = None
-    if keys_look_like_merged_effective(len(appcontext_keys), merged_key_count):
-        appcontext_rejected = (
-            f"appcontext returned {len(appcontext_keys)} keys "
-            f"(>= local threshold {threshold} for merged {merged_key_count})"
-        )
-        if debug:
-            print(f"Debug: {appcontext_rejected}", file=sys.stderr)
-        appcontext_keys = []
-
     defaultonly_content = fetch_defaultonly_content(conf_endpoint, auth, headers)
     defaultonly_keys = refine_defaultcontext_keys(defaultonly_content, spec)
-
-    if defaultonly_keys:
-        local_keys = keys_defined_in_local_layer(appcontext_content, defaultonly_content, spec)
-        if local_keys:
-            method = "defaultonly-diff"
-            source = "REST (appcontext keys absent from or differing vs app default/)"
-        else:
-            rejected_reason = (
-                f"stanza '{stanza_name}' exists only in app default/{spec.conf_file}, not local/"
-            )
-            local_keys = []
-            method = "rejected"
-            source = "REST (rejected — default/ only; use --default_only)"
+    if not defaultonly_keys:
         if debug:
             print(
                 f"Debug local discovery [{spec.name}/{stanza_name}]: "
-                f"defaultonly={len(defaultonly_keys)} layer_local={len(local_keys)} "
-                f"method={method}",
+                f"listed in default/ collection but defaultonly stanza fetch empty; "
+                f"falling back",
                 file=sys.stderr,
             )
-        return LocalDiscoveryResult(
-            local_keys=local_keys,
-            source=source,
-            method=method,
-            merged_key_count=merged_key_count,
-            baseline_key_count=len(defaultonly_keys),
-            baseline_diff_keys=local_keys,
-            appcontext_keys=appcontext_keys or refine_appcontext_local_keys(appcontext_content, spec),
-            rejected_reason=rejected_reason if not local_keys else None,
+        return None
+
+    local_keys = keys_defined_in_local_layer(appcontext_content, defaultonly_content, spec)
+    rejected_reason: Optional[str] = None
+    if local_keys:
+        method = "defaultonly-diff"
+        source = "REST (appcontext keys absent from or differing vs app default/)"
+    else:
+        rejected_reason = (
+            f"stanza '{stanza_name}' exists only in app default/{spec.conf_file}, not local/"
         )
+        local_keys = []
+        method = "rejected"
+        source = "REST (rejected — default/ only; use --default_only)"
+    if debug:
+        print(
+            f"Debug local discovery [{spec.name}/{stanza_name}]: "
+            f"defaultonly={len(defaultonly_keys)} layer_local={len(local_keys)} "
+            f"method={method}",
+            file=sys.stderr,
+        )
+    return LocalDiscoveryResult(
+        local_keys=local_keys,
+        source=source,
+        method=method,
+        merged_key_count=0,
+        baseline_key_count=len(defaultonly_keys),
+        baseline_diff_keys=local_keys,
+        appcontext_keys=appcontext_keys or refine_appcontext_local_keys(appcontext_content, spec),
+        rejected_reason=rejected_reason if not local_keys else None,
+    )
+
+
+def _discover_local_conf_keys_baseline_fallback(
+    conf_endpoint: str,
+    stanza_name: str,
+    spec: ConfTypeSpec,
+    auth,
+    headers: dict,
+    *,
+    merged_content: dict,
+    merged_key_count: int,
+    appcontext_content: dict,
+    appcontext_keys: List[str],
+    appcontext_rejected: Optional[str],
+    debug: bool = False,
+) -> LocalDiscoveryResult:
+    """Inherited baseline diff cross-checked with appcontext when appcontext alone is inconclusive."""
+    threshold = local_key_count_threshold(merged_key_count)
 
     baseline, has_app_default_stanza = build_inherited_conf_baseline(
         conf_endpoint, stanza_name, merged_content, spec, auth, headers, debug=debug
@@ -1411,7 +1538,6 @@ def discover_local_conf_keys(
             method = "baseline-intersect-appcontext"
             source = "REST (baseline diff ∩ appcontext)"
         else:
-            # Small baseline diff with no appcontext overlap — prefer the smaller set.
             if len(appcontext_keys) <= len(baseline_diff_keys):
                 local_keys = appcontext_keys
                 method = "appcontext"
@@ -1469,7 +1595,139 @@ def discover_local_conf_keys(
         baseline_diff_keys=baseline_diff_keys,
         appcontext_keys=appcontext_keys,
         rejected_reason=rejected_reason,
+    )
+
+
+def discover_local_conf_keys(
+    conf_endpoint: str,
+    spec: ConfTypeSpec,
+    auth,
+    headers: dict,
+    debug: bool = False,
+) -> Optional[LocalDiscoveryResult]:
+    """
+    Discover keys defined in local/{conf_file} using REST only.
+
+    Minimizes REST calls for the common local-only case:
+    1. List default/ stanzas (collection defaultonly=true, one GET)
+    2. appcontext=true for app-layer keys (one GET)
+    3. defaultonly=true per stanza only when listed in app default/
+
+    Merged effective config and inherited baseline probes run only when
+    appcontext alone is inconclusive or fails merged-config sanity checks.
+    """
+    stanza_name = conf_stanza_name(conf_endpoint)
+
+    stanza_in_default = stanza_in_app_default_layer(conf_endpoint, stanza_name, auth, headers)
+
+    appcontext_content = fetch_appcontext_content(conf_endpoint, auth, headers)
+    appcontext_keys = refine_appcontext_local_keys(appcontext_content, spec)
+
+    if stanza_in_default:
+        default_layer_result = _discover_local_from_default_layer(
+            conf_endpoint,
+            stanza_name,
+            spec,
+            auth,
+            headers,
+            appcontext_content,
+            appcontext_keys,
+            debug=debug,
         )
+        if default_layer_result is not None:
+            return default_layer_result
+
+    # Local-only stanza (not in app default/): appcontext is sufficient when small.
+    if (
+        not stanza_in_default
+        and appcontext_keys
+        and len(appcontext_keys) < _LOCAL_KEY_MERGED_MIN
+    ):
+        if debug:
+            print(
+                f"Debug local discovery [{spec.name}/{stanza_name}]: "
+                f"appcontext={len(appcontext_keys)} method=appcontext "
+                f"(no app default/ stanza; skipped merged fetch)",
+                file=sys.stderr,
+            )
+        return LocalDiscoveryResult(
+            local_keys=appcontext_keys,
+            source="REST (appcontext app-local keys; no app default/ stanza)",
+            method="appcontext",
+            merged_key_count=0,
+            baseline_key_count=0,
+            baseline_diff_keys=[],
+            appcontext_keys=appcontext_keys,
+        )
+
+    merged_entry = fetch_rest_entry(conf_endpoint, auth, headers, optional=True)
+    if not merged_entry:
+        return None if not appcontext_keys else LocalDiscoveryResult(
+            local_keys=appcontext_keys,
+            source="REST (appcontext app-local keys; merged stanza unavailable)",
+            method="appcontext",
+            merged_key_count=0,
+            baseline_key_count=0,
+            baseline_diff_keys=[],
+            appcontext_keys=appcontext_keys,
+        )
+
+    merged_content = extract_conf_content(merged_entry)
+    merged_key_count = len(merged_content)
+    if not merged_content:
+        return LocalDiscoveryResult(
+            local_keys=[],
+            source="REST (empty merged stanza)",
+            method="none",
+            merged_key_count=0,
+            baseline_key_count=0,
+            baseline_diff_keys=[],
+            appcontext_keys=appcontext_keys,
+            rejected_reason="merged stanza returned no content keys",
+        )
+
+    appcontext_rejected: Optional[str] = None
+    if appcontext_keys and keys_look_like_merged_effective(len(appcontext_keys), merged_key_count):
+        threshold = local_key_count_threshold(merged_key_count)
+        appcontext_rejected = (
+            f"appcontext returned {len(appcontext_keys)} keys "
+            f"(>= local threshold {threshold} for merged {merged_key_count})"
+        )
+        if debug:
+            print(f"Debug: {appcontext_rejected}", file=sys.stderr)
+        appcontext_keys = []
+
+    if appcontext_keys:
+        if debug:
+            print(
+                f"Debug local discovery [{spec.name}/{stanza_name}]: "
+                f"merged={merged_key_count} appcontext={len(appcontext_keys)} "
+                f"method=appcontext (no app default/ stanza)",
+                file=sys.stderr,
+            )
+        return LocalDiscoveryResult(
+            local_keys=appcontext_keys,
+            source="REST (appcontext app-local keys; no app default/ stanza)",
+            method="appcontext",
+            merged_key_count=merged_key_count,
+            baseline_key_count=0,
+            baseline_diff_keys=[],
+            appcontext_keys=appcontext_keys,
+        )
+
+    return _discover_local_conf_keys_baseline_fallback(
+        conf_endpoint,
+        stanza_name,
+        spec,
+        auth,
+        headers,
+        merged_content=merged_content,
+        merged_key_count=merged_key_count,
+        appcontext_content=appcontext_content,
+        appcontext_keys=appcontext_keys,
+        appcontext_rejected=appcontext_rejected,
+        debug=debug,
+    )
 
 
 def log_default_discovery_report(
@@ -1585,8 +1843,20 @@ def export_default_conf_values(
     default_keys: List[str],
     auth,
     headers: dict,
+    *,
+    layer_entry: Optional[dict] = None,
 ) -> Tuple[dict, List[str], dict]:
     """Export values for default/ keys from defaultonly or defaultcontext layer."""
+    if layer_entry is not None:
+        raw_content, _missing = export_requested_keys(layer_entry, default_keys)
+        content = {
+            key: value
+            for key, value in raw_content.items()
+            if key in default_keys and value is not None
+        }
+        missing_keys = [key for key in default_keys if key not in content]
+        return content, missing_keys, layer_entry
+
     stanza_name = conf_stanza_name(conf_endpoint)
     collection = conf_collection_endpoint(conf_endpoint)
     entry: Optional[dict] = None
@@ -1994,6 +2264,28 @@ def print_summary(mode: str, payload: dict):
     print("========================================\n")
 
 
+def resolve_conf_export_context(
+    endpoint: str,
+) -> Optional[Tuple[ConfTypeSpec, str, str, str, str]]:
+    """Map a KO or conf REST URL to conf export context, if recognized."""
+    for spec in CONF_TYPE_REGISTRY.values():
+        ctx = resolve_local_export_context(endpoint, spec)
+        if ctx:
+            owner, app, stanza_name, conf_endpoint = ctx
+            return spec, owner, app, stanza_name, conf_endpoint
+    return None
+
+
+def warn_not_local_keys(not_local_keys: list, spec: ConfTypeSpec) -> None:
+    if not not_local_keys:
+        return
+    print(
+        f"Warning: The following requested keys are not defined in local/{spec.conf_file} "
+        f"and were omitted: {not_local_keys}",
+        file=sys.stderr,
+    )
+
+
 def warn_missing_keys(target_entry: dict, missing_keys: list) -> None:
     if not missing_keys:
         return
@@ -2014,6 +2306,57 @@ def run_export(args, auth, headers) -> None:
     if not requested_keys:
         print("Error: --keys is required when using '--mode export'", file=sys.stderr)
         sys.exit(1)
+
+    conf_ctx = resolve_conf_export_context(args.endpoint)
+    if conf_ctx:
+        spec, owner, app, stanza_name, conf_endpoint = conf_ctx
+        discovery = discover_local_conf_keys(
+            conf_endpoint, spec, auth, headers, debug=args.debug_local_keys
+        )
+        if discovery is None:
+            print(
+                "Error: REST local key discovery failed for "
+                f"stanza '{stanza_name}' in app '{app}'.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        log_local_discovery_report(
+            spec,
+            app=app,
+            stanza=stanza_name,
+            discovery=discovery,
+            verbose=args.debug_local_keys,
+        )
+
+        local_key_set = set(discovery.local_keys)
+        keys_to_export = [key for key in requested_keys if key in local_key_set]
+        not_local_keys = [key for key in requested_keys if key not in local_key_set]
+        if not_local_keys:
+            warn_not_local_keys(not_local_keys, spec)
+
+        if not keys_to_export:
+            if discovery.rejected_reason:
+                print(
+                    f"Error: local key discovery rejected for stanza '{stanza_name}' "
+                    f"in app '{app}': {discovery.rejected_reason}",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    f"Error: none of the requested keys are defined in local/{spec.conf_file} "
+                    f"for stanza '{stanza_name}' in app '{app}'.",
+                    file=sys.stderr,
+                )
+            sys.exit(1)
+
+        content, missing_keys, conf_entry = export_local_conf_values(
+            conf_endpoint, keys_to_export, auth, headers
+        )
+        warn_missing_keys(conf_entry, missing_keys)
+        out_p = build_flat_key_export(content, keys_to_export)
+        write_json_output(out_p, args.output, "Successfully exported keys to '{}'")
+        return
 
     target_entry = fetch_target_entry(args.endpoint, auth, headers)
     out_p, missing_keys = export_requested_keys(target_entry, requested_keys)
@@ -2096,7 +2439,11 @@ def run_export_default_local(spec: ConfTypeSpec, args, auth, headers) -> None:
         sys.exit(1)
 
     content, missing_keys, conf_entry = export_default_conf_values(
-        conf_endpoint, discovery.default_keys, auth, headers
+        conf_endpoint,
+        discovery.default_keys,
+        auth,
+        headers,
+        layer_entry=discovery.default_layer_entry,
     )
     warn_missing_keys(conf_entry, missing_keys)
 

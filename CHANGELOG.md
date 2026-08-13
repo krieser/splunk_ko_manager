@@ -5,6 +5,18 @@ All notable changes to `splunk_ko_manager.py` are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.1] - 2026-08-13
+
+### Changed
+
+- **Local export REST minimization** — probe default/ collection + `appcontext=true` first; fetch `defaultonly=true` and merged effective config only when needed.
+- **`--default_only` REST minimization** — list default/ stanzas before per-stanza fetch; reuse `defaultonly` discovery response for export values; skip merged on happy path; views probe `defaultcontext` before `appcontext`/effective.
+- **`--mode export --keys`** — for conf/KO endpoints, export only keys defined in `local/` (inherited/merged keys omitted with stderr warning).
+
+### Added
+
+- **`.gitignore`** — ignore local Splunk test scratch files and export snapshots.
+
 ## [1.6.0] - 2026-08-09
 
 ### Added
@@ -123,6 +135,7 @@ First official release of the Splunk Knowledge Object Manager CLI.
 - Export output uses legible JSON (`indent=2`, sorted keys, UTF-8).
 - `endpointreview` filters out `null` values recursively before printing.
 
+[1.6.1]: https://github.com/krieser/splunk_ko_manager/releases/tag/v1.6.1
 [1.6.0]: https://github.com/krieser/splunk_ko_manager/releases/tag/v1.6.0
 [1.5.0]: #
 [1.4.3]: #

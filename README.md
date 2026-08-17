@@ -57,6 +57,12 @@ python splunk_ko_manager.py \
   --endpoint 'https://127.0.0.1:8089/servicesNS/nobody/recon/saved/searches/my_search' \
   --credentials user 'admin:password' \
   --keys 'search,cron_schedule,description'
+
+# Delete a saved search (or any supported KO entity URL)
+python splunk_ko_manager.py \
+  --mode delete \
+  --endpoint 'https://127.0.0.1:8089/servicesNS/nobody/recon/saved/searches/my_search' \
+  --credentials user 'admin:password'
 ```
 
 ## Modes
@@ -72,6 +78,7 @@ python splunk_ko_manager.py \
 | `endpointreview` | Any REST URL | All non-null fields (discovery) |
 | `update` | Target REST URL | POST JSON from `--input` |
 | `post` | Target REST URL | POST JSON from `--input` + `--name` |
+| `delete` | Single entity REST URL | DELETE the resource at `--endpoint` (all KO types) |
 
 ## Local key discovery
 

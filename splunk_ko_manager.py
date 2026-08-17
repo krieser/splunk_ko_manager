@@ -16,7 +16,7 @@ import urllib3
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-__version__ = "1.6.1"
+__version__ = "1.7.0"
 MIGRATION_ENVELOPE_VERSION = "1"
 
 _DATA_UI_VIEWS_RE = re.compile(
@@ -838,6 +838,28 @@ def splunk_get_json(
         return None
     response.raise_for_status()
     return response.json()
+
+
+def splunk_delete_json(
+    endpoint: str,
+    auth,
+    headers: dict,
+) -> Tuple[int, Optional[dict]]:
+    """DELETE a Splunk REST entity and return (status_code, parsed JSON if any)."""
+    response = requests.delete(
+        endpoint,
+        auth=auth,
+        headers=headers,
+        params={"output_mode": "json"},
+        verify=False,
+    )
+    payload: Optional[dict] = None
+    if response.text:
+        try:
+            payload = response.json()
+        except json.JSONDecodeError:
+            payload = {"raw": response.text}
+    return response.status_code, payload
 
 
 def fetch_rest_entry(
@@ -2264,6 +2286,61 @@ def print_summary(mode: str, payload: dict):
     print("========================================\n")
 
 
+_COLLECTION_ENTITY_TAIL_NAMES = frozenset({
+    "conf-props",
+    "conf-transforms",
+    "conf-savedsearches",
+    "conf-macros",
+    "conf-views",
+    "searches",
+    "macros",
+    "views",
+})
+
+
+def is_entity_endpoint(endpoint: str) -> bool:
+    """True when endpoint URL targets one REST entity, not a collection listing."""
+    path = urlparse(endpoint.split("?")[0]).path.rstrip("/")
+    if not re.search(r"/servicesNS/[^/]+/[^/]+/", path):
+        return False
+    last_segment = unquote(path.rsplit("/", 1)[-1])
+    return bool(last_segment) and last_segment not in _COLLECTION_ENTITY_TAIL_NAMES
+
+
+def resolve_delete_target(endpoint: str) -> Tuple[str, str, str]:
+    """
+    Return (delete_url, resource_type, resource_name) for DELETE.
+
+    View URLs resolve to data/ui/views (canonical delete target). Conf/KO URLs
+    are used as provided when they name a single entity.
+    """
+    base_endpoint = endpoint.split("?")[0].rstrip("/")
+
+    view_ctx = resolve_view_export_context(endpoint)
+    if view_ctx:
+        _owner, _app, view_name, data_ui_views_url = view_ctx
+        return data_ui_views_url, "view", view_name
+
+    conf_ctx = resolve_conf_export_context(endpoint)
+    if conf_ctx:
+        spec, _owner, _app, stanza_name, _conf_endpoint = conf_ctx
+        if not is_entity_endpoint(base_endpoint):
+            collection_hint = spec.ko_collection or f"configs/{spec.conf_rest}"
+            raise ValueError(
+                f"delete requires a single {spec.conf_file} stanza or "
+                f"{collection_hint} entity URL, not a collection"
+            )
+        return base_endpoint, spec.name, stanza_name
+
+    if not is_entity_endpoint(base_endpoint):
+        raise ValueError(
+            "delete requires a single REST entity URL (not a collection). "
+            "Include owner, app, collection, and resource name in --endpoint."
+        )
+    resource_name = unquote(base_endpoint.rsplit("/", 1)[-1])
+    return base_endpoint, "resource", resource_name
+
+
 def resolve_conf_export_context(
     endpoint: str,
 ) -> Optional[Tuple[ConfTypeSpec, str, str, str, str]]:
@@ -2364,8 +2441,78 @@ def run_export(args, auth, headers) -> None:
     write_json_output(out_p, args.output, "Successfully exported keys to '{}'")
 
 
+def print_delete_summary(resource_type: str, resource_name: str, endpoint: str) -> None:
+    print(
+        "\n========================================\n"
+        " SUCCESS SUMMARY (DELETE OPERATION)\n"
+        "========================================"
+    )
+    print(f"Deleted {resource_type} '{resource_name}'")
+    print(f" -> endpoint: {endpoint}")
+    print("========================================\n")
+
+
+def run_delete(args, auth, headers) -> None:
+    """DELETE a single Splunk REST entity identified by --endpoint."""
+    try:
+        delete_url, resource_type, resource_name = resolve_delete_target(args.endpoint)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        print(f"Expected URL format: {endpoint_hint_for_mode('delete')}", file=sys.stderr)
+        sys.exit(1)
+
+    print(
+        f"Delete [{resource_type}] resource='{resource_name}'",
+        file=sys.stderr,
+    )
+    print(f"  endpoint={delete_url}", file=sys.stderr)
+
+    status_code, payload = splunk_delete_json(delete_url, auth, headers)
+    print(f"Status Code: {status_code}")
+
+    if status_code in (200, 201, 204):
+        print_delete_summary(resource_type, resource_name, delete_url)
+        if payload:
+            write_json_output(
+                payload,
+                args.output,
+                "Successfully wrote delete response to '{}'",
+            )
+        elif args.output:
+            write_json_output(
+                {
+                    "deleted": resource_name,
+                    "resource_type": resource_type,
+                    "endpoint": delete_url,
+                },
+                args.output,
+                "Successfully wrote delete confirmation to '{}'",
+            )
+        return
+
+    if status_code == 404:
+        print("Operation failed: resource not found at this endpoint (404).", file=sys.stderr)
+    elif status_code == 403:
+        print("Operation failed: permission denied (403).", file=sys.stderr)
+    else:
+        print(f"Operation failed: DELETE returned HTTP {status_code}.", file=sys.stderr)
+    if payload:
+        print("Response JSON:\n", json.dumps(payload, indent=2))
+    sys.exit(1)
+
+
 def endpoint_hint_for_mode(mode: str) -> str:
     """Return a one-line endpoint format hint for CLI errors."""
+    if mode == "delete":
+        return (
+            "/servicesNS/{owner}/{app}/saved/searches/{name}, "
+            "/servicesNS/{owner}/{app}/configs/conf-savedsearches/{stanza}, "
+            "/servicesNS/{owner}/{app}/configs/conf-props/{stanza}, "
+            "/servicesNS/{owner}/{app}/configs/conf-transforms/{stanza}, "
+            "/servicesNS/{owner}/{app}/saved/macros/{name}, "
+            "/servicesNS/{owner}/{app}/configs/conf-macros/{stanza}, "
+            "/servicesNS/{owner}/{app}/saved/views/{name} (or data/ui/views/{name})"
+        )
     if mode == VIEW_EXPORT_MODE:
         return (
             "/servicesNS/{owner}/{app}/saved/views/{name} or "
@@ -2798,7 +2945,7 @@ def run_export_view(args, auth, headers) -> None:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Splunk Knowledge Object Manager — export, review, update, and post via REST.",
+        description="Splunk Knowledge Object Manager — export, review, update, post, and delete via REST.",
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument(
@@ -2811,6 +2958,7 @@ def main():
             "endpointreview",
             "update",
             "post",
+            "delete",
         ],
     )
     parser.add_argument("--endpoint", required=True, help="The Splunk REST endpoint URL.")
@@ -2882,10 +3030,30 @@ def main():
     local_export_modes = set(EXPORT_MODE_TO_CONF_TYPE.keys())
     export_modes = local_export_modes | {VIEW_EXPORT_MODE}
     if args.dry_run:
-        method = "GET" if args.mode in ("export", *export_modes, "endpointreview") else "POST"
+        if args.mode == "delete":
+            method = "DELETE"
+        elif args.mode in ("export", *export_modes, "endpointreview"):
+            method = "GET"
+        else:
+            method = "POST"
+        dry_run_endpoint = args.endpoint
+        if args.mode == "delete":
+            try:
+                dry_run_endpoint, resource_type, resource_name = resolve_delete_target(
+                    args.endpoint
+                )
+            except ValueError as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                print(f"Expected URL format: {endpoint_hint_for_mode('delete')}", file=sys.stderr)
+                sys.exit(1)
         print(f"\n--- DRY RUN: Equivalent Curl Command for {args.mode.upper()} ---")
-        print(generate_curl_dry_run(method, args.endpoint, auth, headers, payload))
-        if args.mode == "export":
+        print(generate_curl_dry_run(method, dry_run_endpoint, auth, headers, payload))
+        if args.mode == "delete":
+            print(
+                f"\nNOTE: Live run DELETEs {resource_type} '{resource_name}' at:\n"
+                f"  {dry_run_endpoint}\n",
+            )
+        elif args.mode == "export":
             dest = args.output if args.output else "STDOUT"
             print(f"\nNOTE: Live run writes keys [{args.keys}] to: {dest}\n")
         elif args.mode in local_export_modes:
@@ -2924,6 +3092,9 @@ def main():
             out_p = export_all_fields(target_entry)
             print(f"Found {len(out_p)} non-null keys on endpoint.", file=sys.stderr)
             write_json_output(out_p, args.output, "Successfully exported all fields to '{}'")
+
+        elif args.mode == "delete":
+            run_delete(args, auth, headers)
 
         else:
             res = requests.post(args.endpoint, auth=auth, headers=headers, data=payload, verify=False, params={"output_mode": "json"})

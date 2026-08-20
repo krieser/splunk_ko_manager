@@ -2,6 +2,8 @@
 
 A web-based simulator and test suite for the SwiftUI **Dice Roll** app. Because SwiftUI requires macOS/iOS and Xcode, this project provides a faithful browser simulator plus automated logic tests you can run on any platform.
 
+> **Running on iPhone?** See **[IPHONE.md](IPHONE.md)** — `localhost` will not work on your phone. Use the native SwiftUI app (recommended) or open **`standalone.html`** in Safari.
+
 ## Project layout
 
 ```

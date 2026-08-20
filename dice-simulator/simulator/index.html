@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Dice Roll Simulator</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="simulator-badge">SwiftUI Web Simulator</div>
+
+    <main class="container" aria-label="Dice Roll app">
+      <h1 class="title">Dice Roll</h1>
+
+      <div id="dice-row" class="dice-row">
+        <div id="die1" class="die-slot"></div>
+        <div id="die2" class="die-slot"></div>
+      </div>
+
+      <p id="score" class="score">Total: 2</p>
+
+      <button id="roll-button" class="roll-button" type="button">Roll Dice</button>
+    </main>
+
+    <section class="test-panel" aria-label="Automated tests">
+      <h2>Logic Tests</h2>
+      <p style="font-size: 14px; color: #636366; margin-bottom: 8px">
+        Validates the JavaScript port of <code>rollDice()</code> against the SwiftUI source.
+      </p>
+      <button id="run-tests" class="run-tests-button" type="button">Run Tests</button>
+      <pre id="test-results" class="test-results" aria-live="polite"></pre>
+    </section>
+
+    <script type="module" src="app.js"></script>
+  </body>
+</html>

@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <title>Dice Roll</title>
+    <style>
+      * { box-sizing: border-box; margin: 0; padding: 0; }
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
+        background: #f2f2f7;
+        min-height: 100dvh;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        color: #1c1c1e;
+        padding: env(safe-area-inset-top) 16px env(safe-area-inset-bottom);
+        -webkit-tap-highlight-color: transparent;
+      }
+      .container {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 40px;
+        padding: 24px;
+        background: white;
+        border-radius: 20px;
+        box-shadow: 0 8px 32px rgba(0,0,0,0.08);
+        width: min(420px, 100%);
+      }
+      .title { font-size: 34px; font-weight: 700; }
+      .dice-row {
+        display: flex;
+        gap: 24px;
+        transition: transform 0.4s cubic-bezier(0.34, 1.56, 0.64, 1);
+      }
+      .dice-row.rolling { transform: rotate(360deg); }
+      .die { width: 88px; height: 88px; color: #ff3b30; }
+      @media (min-width: 390px) { .die { width: 100px; height: 100px; } }
+      .score { font-size: 22px; font-weight: 600; }
+      .roll-button {
+        font-size: 20px;
+        font-weight: 700;
+        color: white;
+        background: #007aff;
+        border: none;
+        border-radius: 12px;
+        width: 200px;
+        height: 50px;
+        cursor: pointer;
+        box-shadow: 0 4px 12px rgba(0,122,255,0.35);
+        touch-action: manipulation;
+      }
+      .roll-button:active { transform: scale(0.97); }
+      .roll-button:disabled { opacity: 0.6; }
+      .hint {
+        margin-top: 24px;
+        font-size: 13px;
+        color: #636366;
+        text-align: center;
+        max-width: 320px;
+        line-height: 1.4;
+      }
+    </style>
+  </head>
+  <body>
+    <main class="container">
+      <h1 class="title">Dice Roll</h1>
+      <div id="dice-row" class="dice-row">
+        <div id="die1"></div>
+        <div id="die2"></div>
+      </div>
+      <p id="score" class="score">Total: 2</p>
+      <button id="roll-button" class="roll-button" type="button">Roll Dice</button>
+    </main>
+    <p class="hint">SwiftUI web simulator — works offline in Safari on iPhone.</p>
+
+    <script>
+      const DOTS = {
+        1: [[0.5,0.5]],
+        2: [[0.28,0.28],[0.72,0.72]],
+        3: [[0.28,0.28],[0.5,0.5],[0.72,0.72]],
+        4: [[0.28,0.28],[0.72,0.28],[0.28,0.72],[0.72,0.72]],
+        5: [[0.28,0.28],[0.72,0.28],[0.5,0.5],[0.28,0.72],[0.72,0.72]],
+        6: [[0.28,0.25],[0.72,0.25],[0.28,0.5],[0.72,0.5],[0.28,0.75],[0.72,0.75]]
+      };
+
+      function renderDieFace(v) {
+        const n = Math.max(1, Math.min(6, v));
+        const dots = DOTS[n].map(([x,y]) =>
+          `<circle cx="${x*100}" cy="${y*100}" r="9" fill="currentColor"/>`
+        ).join("");
+        return `<svg class="die" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg" aria-label="Die ${n}">
+          <rect x="4" y="4" width="92" height="92" rx="16" fill="currentColor" opacity="0.15"/>
+          <rect x="4" y="4" width="92" height="92" rx="16" fill="none" stroke="currentColor" stroke-width="3"/>
+          ${dots}</svg>`;
+      }
+
+      function createInitialState() {
+        return { die1: 1, die2: 1, score: 2, isRolling: false };
+      }
+
+      function rollDice(state) {
+        return {
+          die1: Math.floor(Math.random() * 6) + 1,
+          die2: Math.floor(Math.random() * 6) + 1,
+          isRolling: !state.isRolling,
+          score: 0
+        };
+      }
+
+      const die1El = document.getElementById("die1");
+      const die2El = document.getElementById("die2");
+      const scoreEl = document.getElementById("score");
+      const diceRowEl = document.getElementById("dice-row");
+      const rollButton = document.getElementById("roll-button");
+
+      let state = createInitialState();
+      let animating = false;
+
+      function render() {
+        die1El.innerHTML = renderDieFace(state.die1);
+        die2El.innerHTML = renderDieFace(state.die2);
+        scoreEl.textContent = "Total: " + state.score;
+      }
+
+      rollButton.addEventListener("click", function () {
+        if (animating) return;
+        animating = true;
+        rollButton.disabled = true;
+        state = rollDice(state);
+        state.score = state.die1 + state.die2;
+        render();
+        diceRowEl.classList.remove("rolling");
+        void diceRowEl.offsetWidth;
+        if (state.isRolling) diceRowEl.classList.add("rolling");
+        setTimeout(function () {
+          animating = false;
+          rollButton.disabled = false;
+        }, 450);
+      });
+
+      render();
+    </script>
+  </body>
+</html>

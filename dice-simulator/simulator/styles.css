@@ -1,0 +1,142 @@
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  background: #f2f2f7;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  color: #1c1c1e;
+}
+
+.simulator-badge {
+  position: fixed;
+  top: 12px;
+  right: 12px;
+  background: #007aff;
+  color: white;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 6px 12px;
+  border-radius: 999px;
+  letter-spacing: 0.02em;
+}
+
+.container {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 40px;
+  padding: 24px;
+  background: white;
+  border-radius: 20px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.08);
+  max-width: 420px;
+  width: calc(100% - 32px);
+}
+
+.title {
+  font-size: 34px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+}
+
+.dice-row {
+  display: flex;
+  gap: 30px;
+  transition: transform 0.4s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+.dice-row.rolling {
+  transform: rotate(360deg);
+}
+
+.die {
+  width: 100px;
+  height: 100px;
+  color: #ff3b30;
+}
+
+.score {
+  font-size: 22px;
+  font-weight: 600;
+}
+
+.roll-button {
+  font-size: 20px;
+  font-weight: 700;
+  color: white;
+  background: #007aff;
+  border: none;
+  border-radius: 12px;
+  width: 200px;
+  height: 50px;
+  cursor: pointer;
+  box-shadow: 0 4px 12px rgba(0, 122, 255, 0.35);
+  transition: transform 0.1s ease, box-shadow 0.1s ease;
+}
+
+.roll-button:hover {
+  background: #0066d6;
+}
+
+.roll-button:active {
+  transform: scale(0.97);
+  box-shadow: 0 2px 8px rgba(0, 122, 255, 0.3);
+}
+
+.roll-button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.test-panel {
+  margin-top: 32px;
+  width: calc(100% - 32px);
+  max-width: 640px;
+  background: white;
+  border-radius: 16px;
+  padding: 20px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.06);
+}
+
+.test-panel h2 {
+  font-size: 18px;
+  margin-bottom: 12px;
+}
+
+.test-results {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 13px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+}
+
+.test-pass {
+  color: #34c759;
+}
+
+.test-fail {
+  color: #ff3b30;
+}
+
+.run-tests-button {
+  margin-top: 12px;
+  padding: 8px 16px;
+  border: 1px solid #007aff;
+  background: transparent;
+  color: #007aff;
+  border-radius: 8px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.run-tests-button:hover {
+  background: rgba(0, 122, 255, 0.08);
+}
